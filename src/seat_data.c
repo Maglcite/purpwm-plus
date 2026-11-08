@@ -51,10 +51,22 @@ static uint32_t next_serial(purp_server_t *s) {
     return wl_display_next_serial(s->display);
 }
 
+static int32_t seat_coord(int64_t value) {
+    return value < INT32_MIN ? INT32_MIN : value > INT32_MAX ? INT32_MAX : (int32_t)value;
+}
+
 
 /* =========================================================================================== */
 /* Role implementations (cursor surface + DnD icon live in the seat)                          */
 /* =========================================================================================== */
+
+static void cursor_role_commit(purp_surface_t *surface) {
+    purp_seat_t *seat = server_seat(surface->server);
+    if (seat->cursor_surface != surface) return;
+    seat->cursor_hotspot.x = seat_coord((int64_t)seat->cursor_hotspot.x - surface->current.dx);
+    seat->cursor_hotspot.y = seat_coord((int64_t)seat->cursor_hotspot.y - surface->current.dy);
+    purp_host_damage_all(surface->server);
+}
 
 static void cursor_role_destroy(purp_surface_t *surface) {
     purp_seat_t *seat = server_seat(surface->server);
@@ -66,8 +78,19 @@ static void cursor_role_destroy(purp_surface_t *surface) {
 }
 
 static const purp_surface_role_t cursor_role = {
-    .name = "cursor", .kind = PURP_ROLE_CURSOR, .destroy = cursor_role_destroy,
+    .name = "cursor", .kind = PURP_ROLE_CURSOR,
+    .commit = cursor_role_commit, .destroy = cursor_role_destroy,
 };
+
+static void dnd_icon_role_commit(purp_surface_t *surface) {
+    purp_seat_t *seat = server_seat(surface->server);
+    if (seat->drag.icon != surface) return;
+    seat->drag.drag_icon_offset.x =
+        seat_coord((int64_t)seat->drag.drag_icon_offset.x + surface->current.dx);
+    seat->drag.drag_icon_offset.y =
+        seat_coord((int64_t)seat->drag.drag_icon_offset.y + surface->current.dy);
+    purp_host_damage_all(surface->server);
+}
 
 static void dnd_icon_role_destroy(purp_surface_t *surface) {
     purp_seat_t *seat = server_seat(surface->server);
@@ -75,7 +98,8 @@ static void dnd_icon_role_destroy(purp_surface_t *surface) {
 }
 
 static const purp_surface_role_t dnd_icon_role = {
-    .name = "dnd-icon", .kind = PURP_ROLE_DND_ICON, .destroy = dnd_icon_role_destroy,
+    .name = "dnd-icon", .kind = PURP_ROLE_DND_ICON,
+    .commit = dnd_icon_role_commit, .destroy = dnd_icon_role_destroy,
 };
 
 static void cursor_surface_died(struct wl_listener *listener, void *data) {
@@ -895,12 +919,25 @@ static void data_device_destroyed(struct wl_resource *res) {
 static void data_device_start_drag(struct wl_client *client, struct wl_resource *res,
                                    struct wl_resource *source, struct wl_resource *origin,
                                    struct wl_resource *icon, uint32_t serial) {
-    (void)client;
     purp_server_t *s = device_server(res);
     if (!s) return;
     purp_seat_t *seat = server_seat(s);
     purp_surface_t *origin_surface = purp_surface_from_resource(origin);
-    if (!origin_surface) return;
+    if (!origin_surface || !origin_surface->resource ||
+        wl_resource_get_client(origin_surface->resource) != client || !serial)
+        return;
+    bool pointer_serial = serial == seat->last_button_serial &&
+        seat->last_button_client == client && seat->pressed_button_count > 0 &&
+        seat->pointer_focus == origin_surface;
+    purp_touch_point_t *touch_point = NULL;
+    for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i) {
+        purp_touch_point_t *point = &seat->touch[i];
+        if (point->active && point->down_serial == serial && point->surface == origin_surface) {
+            touch_point = point;
+            break;
+        }
+    }
+    if (!pointer_serial && !touch_point) return;
     purp_data_source_t *base = source_from_resource(source);
     if (base) {
         purp_source_t *src = wl_container_of(base, src, base);
@@ -910,7 +947,6 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
             return;
         }
     }
-    if (seat->drag.active) purp_seat_drag_cancel(s);
     purp_surface_t *icon_surface = NULL;
     if (icon) {
         icon_surface = purp_surface_from_resource(icon);
@@ -919,12 +955,7 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
                                    WL_DATA_DEVICE_ERROR_ROLE))
             return;
     }
-    bool pointer_serial = serial == seat->last_button_serial;
-    bool touch_serial = serial == seat->last_touch_serial;
-    if (!pointer_serial && !touch_serial) {
-        if (icon_surface) purp_surface_clear_role_data(icon_surface);
-        return;
-    }
+    if (seat->drag.active) purp_seat_drag_cancel(s);
     if (base) {
         purp_source_t *src = wl_container_of(base, src, base);
         src->used = true;
@@ -945,17 +976,14 @@ static void data_device_start_drag(struct wl_client *client, struct wl_resource 
     drag->source = base;
     drag->origin = origin_surface;
     drag->icon = icon_surface;
+    drag->drag_icon_offset = (purp_point_t){0, 0};
     if (!drag_origin_listen(s, origin_surface)) {
         purp_seat_drag_cancel(s);
         wl_resource_post_no_memory(res);
         return;
     }
-    drag->is_touch = !pointer_serial && touch_serial;
-    drag->touch_slot = -1;
-    if (drag->is_touch) {
-        for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i)
-            if (seat->touch[i].active) drag->touch_slot = seat->touch[i].slot;
-    }
+    drag->is_touch = !pointer_serial;
+    drag->touch_slot = drag->is_touch ? touch_point->slot : -1;
     drag->serial = serial;
     purp_surface_t *initial_focus = seat->pointer_focus;
     purp_pointf_t initial_origin = seat->pointer_focus_origin;
@@ -1593,6 +1621,15 @@ static const struct wl_keyboard_interface keyboard_impl = {
     .release = offer_destroy_request,
 };
 
+struct touch_resource_state {
+    bool frame_pending;
+};
+
+static void touch_resource_destroyed(struct wl_resource *res) {
+    free(wl_resource_get_user_data(res));
+    resource_unlink(res);
+}
+
 static const struct wl_touch_interface touch_impl = {
     .release = offer_destroy_request,
 };
@@ -1659,13 +1696,19 @@ static void seat_get_keyboard(struct wl_client *client, struct wl_resource *res,
 static void seat_get_touch(struct wl_client *client, struct wl_resource *res, uint32_t id) {
     purp_server_t *s = wl_resource_get_user_data(res);
     purp_seat_t *seat = server_seat(s);
-    struct wl_resource *touch = wl_resource_create(client, &wl_touch_interface,
-                                                 wl_resource_get_version(res), (uint32_t)id);
-    if (!touch) {
+    struct touch_resource_state *state = calloc(1, sizeof(*state));
+    if (!state) {
         wl_resource_post_no_memory(res);
         return;
     }
-    wl_resource_set_implementation(touch, &touch_impl, s, resource_unlink);
+    struct wl_resource *touch = wl_resource_create(client, &wl_touch_interface,
+                                                 wl_resource_get_version(res), (uint32_t)id);
+    if (!touch) {
+        free(state);
+        wl_resource_post_no_memory(res);
+        return;
+    }
+    wl_resource_set_implementation(touch, &touch_impl, state, touch_resource_destroyed);
     wl_list_insert(&seat->touches, wl_resource_get_link(touch));
 }
 
@@ -1814,6 +1857,10 @@ void purp_seat_keyboard_send_key(purp_server_t *s, uint32_t time_ms, uint32_t ke
     if (!focus || !focus->resource) return;
     struct wl_client *client = wl_resource_get_client(focus->resource);
     uint32_t serial = next_serial(s);
+    if (pressed) {
+        seat->last_keyboard_serial = serial;
+        seat->last_keyboard_client = client;
+    }
     struct wl_resource *keyboard;
     wl_list_for_each(keyboard, &seat->keyboards, link) {
         if (wl_resource_get_client(keyboard) != client) continue;
@@ -1921,13 +1968,22 @@ uint32_t purp_seat_pointer_send_button(purp_server_t *s, uint32_t time_ms, uint3
         add_u32(seat->pressed_buttons, &seat->pressed_button_count, PURP_MAX_PRESSED_BUTTONS,
                 button);
     } else {
-        remove_u32(seat->pressed_buttons, &seat->pressed_button_count, button);
+        for (size_t i = 0; i < seat->pressed_button_count; ++i) {
+            if (seat->pressed_buttons[i] != button) continue;
+            --seat->pressed_button_count;
+            memmove(&seat->pressed_buttons[i], &seat->pressed_buttons[i + 1],
+                    (seat->pressed_button_count - i) * sizeof(seat->pressed_buttons[0]));
+            break;
+        }
     }
     purp_surface_t *focus = seat->pointer_focus;
     if (!focus || !focus->resource) return 0;
     struct wl_client *client = wl_resource_get_client(focus->resource);
     uint32_t serial = next_serial(s);
-    seat->last_button_serial = serial;
+    if (pressed) {
+        seat->last_button_serial = serial;
+        seat->last_button_client = client;
+    }
     struct wl_resource *pointer;
     wl_list_for_each(pointer, &seat->pointers, link) {
         if (wl_resource_get_client(pointer) != client) continue;
@@ -2026,8 +2082,15 @@ typedef struct purp_touch_surface_listener {
 static void touch_surface_died(struct wl_listener *listener, void *data) {
     purp_touch_surface_listener_t *box = wl_container_of(listener, box, listener);
     purp_server_t *s = box->server;
-    (void)data;
-    purp_seat_touch_send_cancel(s, -1);
+    purp_surface_t *surface = data;
+    for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i) {
+        purp_touch_point_t *point = &s->seat.touch[i];
+        if (!point->active || point->surface != surface) continue;
+        purp_seat_touch_send_cancel(s, point->slot);
+        return;
+    }
+    wl_list_remove(&listener->link);
+    free(box);
 }
 
 static bool touch_surface_listen(purp_server_t *s, purp_surface_t *surface) {
@@ -2089,6 +2152,7 @@ void purp_seat_touch_send_down(purp_server_t *s, uint32_t time_ms, int32_t slot,
     if (old_surface != surface) touch_surface_unlisten(seat, old_surface);
     point->active = true;
     point->slot = slot;
+    point->down_serial = 0;
     point->surface = surface;
     point->pos = pos;
     point->surface_origin = origin;
@@ -2096,9 +2160,13 @@ void purp_seat_touch_send_down(purp_server_t *s, uint32_t time_ms, int32_t slot,
     struct wl_client *client = wl_resource_get_client(surface->resource);
     uint32_t serial = next_serial(s);
     seat->last_touch_serial = serial;
+    seat->last_touch_client = client;
+    point->down_serial = serial;
     struct wl_resource *touch;
     wl_list_for_each(touch, &seat->touches, link) {
         if (wl_resource_get_client(touch) != client) continue;
+        struct touch_resource_state *state = wl_resource_get_user_data(touch);
+        state->frame_pending = true;
         wl_touch_send_down(touch, serial, time_ms, surface->resource, slot,
                            wl_fixed_from_double(pos.x - origin.x),
                            wl_fixed_from_double(pos.y - origin.y));
@@ -2117,6 +2185,8 @@ void purp_seat_touch_send_motion(purp_server_t *s, uint32_t time_ms, int32_t slo
     struct wl_resource *touch;
     wl_list_for_each(touch, &seat->touches, link) {
         if (wl_resource_get_client(touch) != client) continue;
+        struct touch_resource_state *state = wl_resource_get_user_data(touch);
+        state->frame_pending = true;
         wl_touch_send_motion(touch, time_ms, slot,
                              wl_fixed_from_double(pos.x - point->surface_origin.x),
                              wl_fixed_from_double(pos.y - point->surface_origin.y));
@@ -2130,6 +2200,7 @@ void purp_seat_touch_send_up(purp_server_t *s, uint32_t time_ms, int32_t slot) {
     if (!point) return;
     purp_surface_t *surface = point->surface;
     point->active = false;
+    point->down_serial = 0;
     point->surface = NULL;
     touch_surface_unlisten(seat, surface);
     if (!surface || !surface->resource) return;
@@ -2138,37 +2209,47 @@ void purp_seat_touch_send_up(purp_server_t *s, uint32_t time_ms, int32_t slot) {
     struct wl_resource *touch;
     wl_list_for_each(touch, &seat->touches, link) {
         if (wl_resource_get_client(touch) != client) continue;
+        struct touch_resource_state *state = wl_resource_get_user_data(touch);
+        state->frame_pending = true;
         wl_touch_send_up(touch, serial, time_ms, slot);
     }
 }
 
 void purp_seat_touch_send_cancel(purp_server_t *s, int32_t slot) {
-    (void)slot;
     if (!s) return;
     purp_seat_t *seat = server_seat(s);
-    if (seat->drag.active && seat->drag.is_touch) purp_seat_drag_cancel(s);
+    purp_touch_point_t *target = slot >= 0 ? purp_seat_touch_point(s, slot) : NULL;
+    if (slot >= 0 && !target) return;
+    struct wl_client *target_client = target && target->surface && target->surface->resource
+        ? wl_resource_get_client(target->surface->resource) : NULL;
     struct wl_client *clients[PURP_MAX_TOUCH_POINTS];
     size_t count = 0;
     for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i) {
         purp_touch_point_t *point = &seat->touch[i];
         if (!point->active) continue;
         purp_surface_t *surface = point->surface;
+        struct wl_client *client = surface && surface->resource
+            ? wl_resource_get_client(surface->resource) : NULL;
+        if (slot >= 0 && point != target && (!target_client || client != target_client)) continue;
+        if (seat->drag.active && seat->drag.is_touch && seat->drag.touch_slot == point->slot)
+            purp_seat_drag_cancel(s);
         point->active = false;
-        struct wl_client *client =
-            point->surface && point->surface->resource
-                ? wl_resource_get_client(point->surface->resource) : NULL;
+        point->down_serial = 0;
         point->surface = NULL;
         touch_surface_unlisten(seat, surface);
         if (!client) continue;
         bool seen = false;
         for (size_t n = 0; n < count; ++n)
             if (clients[n] == client) seen = true;
-        if (!seen && count < PURP_MAX_TOUCH_POINTS) clients[count++] = client;
+        if (!seen) clients[count++] = client;
     }
+    if (slot < 0 && seat->drag.active && seat->drag.is_touch) purp_seat_drag_cancel(s);
     for (size_t n = 0; n < count; ++n) {
         struct wl_resource *touch;
         wl_list_for_each(touch, &seat->touches, link) {
             if (wl_resource_get_client(touch) != clients[n]) continue;
+            struct touch_resource_state *state = wl_resource_get_user_data(touch);
+            state->frame_pending = false;
             wl_touch_send_cancel(touch);
             wl_touch_send_frame(touch);
         }
@@ -2177,24 +2258,12 @@ void purp_seat_touch_send_cancel(purp_server_t *s, int32_t slot) {
 
 void purp_seat_touch_send_frame(purp_server_t *s) {
     if (!s) return;
-    purp_seat_t *seat = server_seat(s);
-    struct wl_client *clients[PURP_MAX_TOUCH_POINTS];
-    size_t count = 0;
-    for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i) {
-        purp_touch_point_t *point = &seat->touch[i];
-        if (!point->active || !point->surface || !point->surface->resource) continue;
-        struct wl_client *client = wl_resource_get_client(point->surface->resource);
-        bool seen = false;
-        for (size_t n = 0; n < count; ++n)
-            if (clients[n] == client) seen = true;
-        if (!seen && count < PURP_MAX_TOUCH_POINTS) clients[count++] = client;
-    }
-    for (size_t n = 0; n < count; ++n) {
-        struct wl_resource *touch;
-        wl_list_for_each(touch, &seat->touches, link) {
-            if (wl_resource_get_client(touch) != clients[n]) continue;
-            wl_touch_send_frame(touch);
-        }
+    struct wl_resource *touch;
+    wl_list_for_each(touch, &s->seat.touches, link) {
+        struct touch_resource_state *state = wl_resource_get_user_data(touch);
+        if (!state->frame_pending) continue;
+        state->frame_pending = false;
+        wl_touch_send_frame(touch);
     }
 }
 
@@ -2202,16 +2271,34 @@ bool purp_seat_validate_grab_serial(purp_server_t *s, struct wl_client *client,
                                     uint32_t serial) {
     if (!s || !client || !serial) return false;
     purp_seat_t *seat = server_seat(s);
-    if (serial == seat->last_button_serial && seat->pointer_focus &&
-        seat->pointer_focus->resource &&
+    if (serial == seat->last_button_serial && seat->last_button_client == client &&
+        seat->pressed_button_count && seat->pointer_focus && seat->pointer_focus->resource &&
         wl_resource_get_client(seat->pointer_focus->resource) == client)
         return true;
-    if (serial == seat->last_touch_serial) {
-        for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i) {
-            purp_touch_point_t *point = &seat->touch[i];
-            if (!point->active || !point->surface || !point->surface->resource) continue;
-            if (wl_resource_get_client(point->surface->resource) == client) return true;
-        }
+    for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i) {
+        purp_touch_point_t *point = &seat->touch[i];
+        if (!point->active || point->down_serial != serial ||
+            !point->surface || !point->surface->resource)
+            continue;
+        if (wl_resource_get_client(point->surface->resource) == client) return true;
+    }
+    return false;
+}
+
+bool purp_seat_validate_input_serial(purp_server_t *s, struct wl_client *client,
+                                     uint32_t serial) {
+    if (!s || !client || !serial) return false;
+    purp_seat_t *seat = server_seat(s);
+    if ((serial == seat->last_button_serial && seat->last_button_client == client) ||
+        (serial == seat->last_touch_serial && seat->last_touch_client == client) ||
+        (serial == seat->last_keyboard_serial && seat->last_keyboard_client == client))
+        return true;
+    for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i) {
+        purp_touch_point_t *point = &seat->touch[i];
+        if (!point->active || point->down_serial != serial ||
+            !point->surface || !point->surface->resource)
+            continue;
+        if (wl_resource_get_client(point->surface->resource) == client) return true;
     }
     return false;
 }
@@ -2259,7 +2346,7 @@ static void xdg_output_send_state_to(struct wl_resource *res, purp_monitor_t *mo
     if (version >= ZXDG_OUTPUT_V1_NAME_SINCE_VERSION) zxdg_output_v1_send_name(res, mon->name);
     if (version >= ZXDG_OUTPUT_V1_DESCRIPTION_SINCE_VERSION)
         zxdg_output_v1_send_description(res, mon->description[0] ? mon->description : mon->name);
-    if (version < ZXDG_OUTPUT_V1_DONE_SINCE_VERSION) zxdg_output_v1_send_done(res);
+    if (version < 3) zxdg_output_v1_send_done(res);
 }
 
 void purp_output_send_state(purp_output_t *output) {
@@ -2267,8 +2354,14 @@ void purp_output_send_state(purp_output_t *output) {
     if (!mon) return;
     struct wl_resource *res;
     wl_list_for_each(res, &output->resources, link) output_send_state_to(res, mon);
-    wl_list_for_each(res, &output->xdg_output_resources, link)
+    wl_list_for_each(res, &output->xdg_output_resources, link) {
         xdg_output_send_state_to(res, mon);
+        if (wl_resource_get_version(res) < 3) continue;
+        struct wl_resource *wl_output =
+            purp_output_resource_for_client(output, wl_resource_get_client(res));
+        if (wl_output && wl_resource_get_version(wl_output) >= WL_OUTPUT_DONE_SINCE_VERSION)
+            wl_output_send_done(wl_output);
+    }
 }
 
 struct wl_resource *purp_output_resource_for_client(purp_output_t *output,
@@ -2379,7 +2472,12 @@ static void xdg_output_manager_get(struct wl_client *client, struct wl_resource 
     }
     wl_list_insert(&output->xdg_output_resources, wl_resource_get_link(xdg));
     purp_monitor_t *mon = output_monitor(output);
-    if (mon) xdg_output_send_state_to(xdg, mon);
+    if (mon) {
+        xdg_output_send_state_to(xdg, mon);
+        if (wl_resource_get_version(xdg) >= 3 &&
+            wl_resource_get_version(output_res) >= WL_OUTPUT_DONE_SINCE_VERSION)
+            wl_output_send_done(output_res);
+    }
 }
 
 static const struct zxdg_output_manager_v1_interface xdg_output_manager_impl = {

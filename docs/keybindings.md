@@ -47,7 +47,7 @@ PAM service from `PURPWM_PAM_SERVICE`, `purpwm+`, `purpwm`, `vlock`, or `login`.
 | `Mod + ,` / `Mod + .` | Focus previous / next monitor |
 | `Mod + Shift + ,` / `Mod + Shift + .` | Move focused window to previous / next monitor |
 | `Mod + Shift + Return` | Zoom: swap with the master window; on the master, swap with the next window |
-| `Mod + Arrow` | Swap within the tiled layout, or nudge a floating window by 40 logical pixels |
+| `Mod + Arrow` | Swap with the spatial neighbor in that direction (hopping to an adjacent monitor at the screen edge), or nudge a floating window by 40 logical pixels |
 | `Mod + Shift + Arrow` | Resize the right/bottom edge or adjacent tiled split; a tap moves 16 px, holding accelerates |
 | `Mod + Shift + Space` | Toggle floating |
 | `Mod + Shift + f` or `Mod + F11` | Toggle fullscreen |
@@ -129,7 +129,7 @@ kill -USR1 <purpwm+-pid>
 
 | Action | Effect |
 | :--- | :--- |
-| `Mod + Left-drag` / `Mod + Touch-drag` | Float and move a window |
+| `Mod + Left-drag` / `Mod + Touch-drag` | Float and move a window (after a 10 px drag threshold; releasing a dragged window at the top bar maximizes it, and dragging a maximized window down restores it) |
 | `Mod + Right-drag` | Resize; for tiled windows, the nearest splits follow the pointer |
 | `Mod + Middle-click` | Toggle floating |
 | Tap a window, overlay, or popup | Focus it and forward native `wl_touch` events |

@@ -6,6 +6,8 @@
 
 struct configure_record {
     uint32_t serial;
+    purp_rect_t popup_geometry;
+    bool has_popup_geometry;
     struct wl_list link;
 };
 
@@ -17,6 +19,10 @@ struct xdg_state {
 struct popup_state {
     purp_popup_t base;
     bool dismissed;
+    bool has_sent_geometry;
+    purp_rect_t sent_geometry;
+    bool has_acked_geometry;
+    purp_rect_t acked_geometry;
 };
 
 struct activation_state {
@@ -270,6 +276,11 @@ static void configure_clear(purp_xdg_surface_t *xdg) {
         wl_list_remove(&record->link); free(record);
     }
     xdg->configured = false; xdg->configure_serial = 0; xdg->acked_serial = 0;
+    if (xdg->role == PURP_XDG_ROLE_POPUP && xdg->popup) {
+        struct popup_state *popup = PURP_CONTAINER_OF(xdg->popup, struct popup_state, base);
+        popup->has_sent_geometry = false;
+        popup->has_acked_geometry = false;
+    }
 }
 
 static struct configure_record *configure_new(purp_xdg_surface_t *xdg) {
@@ -291,10 +302,12 @@ static void toplevel_configure(purp_toplevel_t *top) {
     struct configure_record *record = configure_new(top->xdg);
     if (!record) return;
     purp_window_configure_t want = top->window->want;
-    uint32_t values[6];
+    uint32_t values[8];
     size_t count = 0;
     if (want.activated) values[count++] = XDG_TOPLEVEL_STATE_ACTIVATED;
     if (want.fullscreen) values[count++] = XDG_TOPLEVEL_STATE_FULLSCREEN;
+    if (want.maximized) values[count++] = XDG_TOPLEVEL_STATE_MAXIMIZED;
+    if (want.resizing) values[count++] = XDG_TOPLEVEL_STATE_RESIZING;
     if (want.tiled && wl_resource_get_version(top->resource) >= 2) {
         values[count++] = XDG_TOPLEVEL_STATE_TILED_LEFT;
         values[count++] = XDG_TOPLEVEL_STATE_TILED_RIGHT;
@@ -302,7 +315,9 @@ static void toplevel_configure(purp_toplevel_t *top) {
         values[count++] = XDG_TOPLEVEL_STATE_TILED_BOTTOM;
     }
     if (!top->has_sent && wl_resource_get_version(top->resource) >= 5) {
-        uint32_t capabilities[] = {XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN};
+        uint32_t capabilities[] = {
+            XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE, XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN
+        };
         struct wl_array array = {sizeof(capabilities), sizeof(capabilities), capabilities};
         xdg_toplevel_send_wm_capabilities(top->resource, &array);
     }
@@ -318,16 +333,20 @@ static void toplevel_configure(purp_toplevel_t *top) {
 }
 
 static void popup_configure(purp_popup_t *popup) {
-    if (PURP_CONTAINER_OF(popup, struct popup_state, base)->dismissed) return;
+    struct popup_state *state = PURP_CONTAINER_OF(popup, struct popup_state, base);
+    if (state->dismissed) return;
     struct configure_record *record = configure_new(popup->xdg);
     if (!record) return;
     if (popup->reposition_pending && wl_resource_get_version(popup->resource) >= 3) {
         xdg_popup_send_repositioned(popup->resource, popup->reposition_token);
         popup->reposition_pending = false;
     }
-    popup->geometry = popup_geometry(popup);
-    xdg_popup_send_configure(popup->resource, popup->geometry.x, popup->geometry.y,
-                            popup->geometry.w, popup->geometry.h);
+    record->popup_geometry = popup_geometry(popup);
+    record->has_popup_geometry = true;
+    state->sent_geometry = record->popup_geometry;
+    state->has_sent_geometry = true;
+    xdg_popup_send_configure(popup->resource, record->popup_geometry.x, record->popup_geometry.y,
+                            record->popup_geometry.w, record->popup_geometry.h);
     configure_finish(popup->xdg, record);
 }
 
@@ -347,7 +366,8 @@ static void configure_schedule(purp_xdg_surface_t *xdg) {
 
 static bool configure_equal(purp_window_configure_t a, purp_window_configure_t b) {
     return a.width == b.width && a.height == b.height && a.activated == b.activated &&
-           a.fullscreen == b.fullscreen && a.tiled == b.tiled;
+           a.fullscreen == b.fullscreen && a.maximized == b.maximized &&
+           a.resizing == b.resizing && a.tiled == b.tiled;
 }
 
 void purp_xdg_flush_configures(purp_server_t *server) {
@@ -362,7 +382,8 @@ void purp_xdg_flush_configures(purp_server_t *server) {
             else top->window->configure_dirty = false;
         } else if (xdg->role == PURP_XDG_ROLE_POPUP && xdg->popup &&
                    xdg->popup->positioner.reactive && xdg->configured &&
-                   !purp_rect_eq(xdg->popup->geometry, popup_geometry(xdg->popup)))
+                   !purp_rect_eq(PURP_CONTAINER_OF(xdg->popup, struct popup_state, base)->sent_geometry,
+                                 popup_geometry(xdg->popup)))
             configure_schedule(xdg);
     }
 }
@@ -392,6 +413,8 @@ void purp_xdg_dismiss_popup_grabs(purp_server_t *server) {
         popup_dismiss(popup);
     }
     purp_host_damage_all(server);
+    purp_input_sync_keyboard_focus(server);
+    purp_input_sync_pointer_focus(server, 0);
 }
 
 static bool popup_visible(purp_popup_t *popup) {
@@ -412,6 +435,24 @@ static void visible_children(struct wl_list *list, purp_popup_t **out, size_t ca
         if (*count < cap) out[(*count)++] = popup;
         visible_children(&popup->xdg->popups, out, cap, count);
     }
+}
+
+size_t purp_xdg_popups_for_root(purp_server_t *server, purp_surface_t *root,
+                                purp_popup_t **out, size_t cap) {
+    if (!server || !root || !out || !cap || purp_server_is_locked(server)) return 0;
+    size_t count = 0;
+    purp_xdg_surface_t *xdg = purp_xdg_surface_from_surface(root);
+    if (xdg && xdg->role == PURP_XDG_ROLE_TOPLEVEL) {
+        visible_children(&xdg->popups, out, cap, &count);
+        return count;
+    }
+    purp_layer_surface_t *layer;
+    wl_list_for_each(layer, &server->layers, link) {
+        if (layer->surface != root) continue;
+        visible_children(&layer->popups, out, cap, &count);
+        break;
+    }
+    return count;
 }
 
 size_t purp_xdg_visible_popups(purp_server_t *server, int monitor, purp_popup_t **out, size_t cap) {
@@ -526,6 +567,45 @@ static void xdg_surface_gone(struct wl_listener *listener, void *data) {
         wl_resource_destroy(xdg->popup->resource);
 }
 
+struct surface_tree_bounds {
+    int64_t left, top, right, bottom;
+    bool valid;
+};
+
+static bool collect_surface_bounds(purp_surface_t *surface, int32_t x, int32_t y, void *data) {
+    struct surface_tree_bounds *bounds = data;
+    int64_t right = (int64_t)x + surface->size.w;
+    int64_t bottom = (int64_t)y + surface->size.h;
+    if (surface->size.w <= 0 || surface->size.h <= 0) return true;
+    if (!bounds->valid) {
+        *bounds = (struct surface_tree_bounds){x, y, right, bottom, true};
+        return true;
+    }
+    if (x < bounds->left) bounds->left = x;
+    if (y < bounds->top) bounds->top = y;
+    if (right > bounds->right) bounds->right = right;
+    if (bottom > bounds->bottom) bounds->bottom = bottom;
+    return true;
+}
+
+static purp_rect_t xdg_client_geometry(purp_xdg_surface_t *xdg) {
+    struct surface_tree_bounds bounds = {0};
+    purp_surface_for_each(xdg->surface, collect_surface_bounds, &bounds);
+    if (!bounds.valid) return (purp_rect_t){0};
+    if (xdg->has_geometry) {
+        purp_rect_t geometry = xdg->geometry;
+        int64_t right = (int64_t)geometry.x + geometry.w;
+        int64_t bottom = (int64_t)geometry.y + geometry.h;
+        if (geometry.x > bounds.left) bounds.left = geometry.x;
+        if (geometry.y > bounds.top) bounds.top = geometry.y;
+        if (right < bounds.right) bounds.right = right;
+        if (bottom < bounds.bottom) bounds.bottom = bottom;
+    }
+    return (purp_rect_t){coord(bounds.left), coord(bounds.top),
+        coord(bounds.right > bounds.left ? bounds.right - bounds.left : 0),
+        coord(bounds.bottom > bounds.top ? bounds.bottom - bounds.top : 0)};
+}
+
 static void xdg_role_commit(purp_surface_t *surface) {
     purp_xdg_surface_t *xdg = surface->role_data;
     if (!xdg) return;
@@ -547,27 +627,41 @@ static void xdg_role_commit(purp_surface_t *surface) {
             wl_resource_post_error(top->resource, XDG_TOPLEVEL_ERROR_INVALID_SIZE, "minimum exceeds maximum");
             return;
         }
+        purp_server_t *server = xdg->server;
+        int index = purp_wm_window_index(&server->wm, win);
+        bool map = !top->mapped && surface->mapped;
         bool unmap = top->mapped && !surface->mapped;
         top->mapped = win->mapped = surface->mapped;
-        win->has_client_geometry = xdg->has_geometry; win->client_geometry = xdg->geometry;
-        win->buffer_size = surface->size;
+        win->client_geometry = xdg_client_geometry(xdg);
+        win->has_client_geometry = win->client_geometry.w > 0 && win->client_geometry.h > 0;
+        win->buffer_size = surface->mapped ? surface->size : (purp_size_t){0};
         win->min_size = top->pending_min_size; win->max_size = top->pending_max_size;
         if (unmap) {
+            if ((server->grab.kind != PURP_GRAB_NONE && server->grab.window_id == win->id) ||
+                (server->key_resize.active && server->key_resize.window_id == win->id))
+                purp_input_cancel_grabs(server);
             detach_children(xdg); configure_clear(xdg);
             xdg->initial_commit_done = false; top->has_sent = false;
             top->parent = NULL;
             top->pending_min_size = top->pending_max_size = (purp_size_t){0, 0};
             win->min_size = win->max_size = (purp_size_t){0, 0};
-            win->is_fullscreen = false;
+            purp_window_set_title(win, "");
+            purp_window_set_app_id(win, "");
+            free(win->rule_seen_app_id); win->rule_seen_app_id = NULL;
+            free(win->rule_seen_title); win->rule_seen_title = NULL;
+            win->rules_applied = false;
+            xdg->has_geometry = false; xdg->has_pending_geometry = false;
+            if (index >= 0) purp_wm_on_window_unmapped(&server->wm, (size_t)index);
         } else {
             xdg->initial_commit_done = true;
-            int index = purp_wm_window_index(&xdg->server->wm, win);
-            if (index >= 0 && surface->mapped) purp_wm_adopt_client_size(&xdg->server->wm, (size_t)index);
+            if (map && index >= 0) purp_wm_on_window_mapped(&server->wm, (size_t)index);
+            if (index >= 0 && surface->mapped) purp_wm_adopt_client_size(&server->wm, (size_t)index);
         }
-        purp_server_relayout(xdg->server);
+        purp_server_relayout(server);
     } else if (xdg->role == PURP_XDG_ROLE_POPUP && xdg->popup) {
         purp_popup_t *popup = xdg->popup;
-        if (PURP_CONTAINER_OF(popup, struct popup_state, base)->dismissed) return;
+        struct popup_state *state = PURP_CONTAINER_OF(popup, struct popup_state, base);
+        if (state->dismissed) return;
         if (!popup->parent) {
             wl_resource_post_error(xdg->wm_base, XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT,
                                    "popup must have a parent before initial commit");
@@ -576,11 +670,17 @@ static void xdg_role_commit(purp_surface_t *surface) {
         if (popup->committed && !surface->mapped) {
             popup_dismiss(popup); configure_clear(xdg); xdg->initial_commit_done = false;
         } else {
+            if (state->has_acked_geometry) {
+                popup->geometry = state->acked_geometry;
+                state->has_acked_geometry = false;
+            }
             xdg->initial_commit_done = true;
             popup->committed = surface->mapped;
             if (first) popup_configure(popup);
         }
         purp_server_update_surface_outputs(xdg->server);
+        purp_input_sync_keyboard_focus(xdg->server);
+        purp_input_sync_pointer_focus(xdg->server, 0);
         purp_host_damage_all(xdg->server);
     }
 }
@@ -612,6 +712,11 @@ static void toplevel_parent(struct wl_client *client, struct wl_resource *resour
         }
     }
     top->parent = parent;
+    purp_server_t *server = top->xdg->server;
+    int index = purp_wm_window_index(&server->wm, top->window);
+    uint64_t parent_id = parent && parent->window && parent->mapped ? parent->window->id : 0;
+    if (index >= 0) purp_wm_set_window_parent(&server->wm, (size_t)index, parent_id);
+    purp_server_relayout(server);
 }
 
 static void toplevel_title(struct wl_client *client, struct wl_resource *resource, const char *title) {
@@ -674,8 +779,22 @@ static void toplevel_max_size(struct wl_client *client, struct wl_resource *reso
 
 static void toplevel_maximize(struct wl_client *client, struct wl_resource *resource) {
     purp_toplevel_t *top = wl_resource_get_user_data(resource);
-    /* Tiling determines size; acknowledge the request without advertising maximized. */
+    purp_server_t *server = top->xdg->server;
     configure_schedule(top->xdg);
+    if (purp_server_is_locked(server)) return;
+    int index = purp_wm_window_index(&server->wm, top->window);
+    if (index >= 0) purp_wm_set_window_maximized(&server->wm, (size_t)index, true);
+    purp_server_relayout(server);
+}
+
+static void toplevel_unmaximize(struct wl_client *client, struct wl_resource *resource) {
+    purp_toplevel_t *top = wl_resource_get_user_data(resource);
+    purp_server_t *server = top->xdg->server;
+    configure_schedule(top->xdg);
+    if (purp_server_is_locked(server)) return;
+    int index = purp_wm_window_index(&server->wm, top->window);
+    if (index >= 0) purp_wm_set_window_maximized(&server->wm, (size_t)index, false);
+    purp_server_relayout(server);
 }
 
 static void toplevel_fullscreen(struct wl_client *client, struct wl_resource *resource,
@@ -709,7 +828,7 @@ static const struct xdg_toplevel_interface toplevel_impl = {
     .set_app_id = toplevel_app_id, .show_window_menu = toplevel_menu,
     .move = toplevel_move, .resize = toplevel_resize,
     .set_max_size = toplevel_max_size, .set_min_size = toplevel_min_size,
-    .set_maximized = toplevel_maximize, .unset_maximized = toplevel_maximize,
+    .set_maximized = toplevel_maximize, .unset_maximized = toplevel_unmaximize,
     .set_fullscreen = toplevel_fullscreen, .unset_fullscreen = toplevel_unfullscreen,
     .set_minimized = toplevel_minimize,
 };
@@ -730,8 +849,12 @@ static void popup_grab(struct wl_client *client, struct wl_resource *resource,
     if (PURP_CONTAINER_OF(popup, struct popup_state, base)->dismissed) return;
     purp_server_t *server = popup->xdg->server;
     if (purp_server_is_locked(server) || !valid_seat(server, seat) ||
-        !purp_seat_validate_grab_serial(server, client, serial)) {
-        popup_dismiss(popup); return;
+        !purp_seat_validate_input_serial(server, client, serial)) {
+        popup_dismiss(popup);
+        purp_input_sync_keyboard_focus(server);
+        purp_input_sync_pointer_focus(server, 0);
+        purp_host_damage_all(server);
+        return;
     }
     if (popup->committed || popup->grabbed) {
         wl_resource_post_error(resource, XDG_POPUP_ERROR_INVALID_GRAB, "popup already mapped or grabbed");
@@ -750,6 +873,8 @@ static void popup_grab(struct wl_client *client, struct wl_resource *resource,
     }
     popup->grabbed = true;
     wl_list_insert(&server->popup_grabs, &popup->grab_link);
+    purp_input_sync_keyboard_focus(server);
+    purp_input_sync_pointer_focus(server, 0);
 }
 
 static bool positioner_complete(purp_positioner_t *p) {
@@ -768,6 +893,8 @@ static void popup_reposition(struct wl_client *client, struct wl_resource *resou
     }
     popup->positioner = *p; popup->reposition_token = token; popup->reposition_pending = true;
     if (popup->xdg->initial_commit_done) popup_configure(popup);
+    purp_input_sync_keyboard_focus(popup->xdg->server);
+    purp_input_sync_pointer_focus(popup->xdg->server, 0);
 }
 
 static const struct xdg_popup_interface popup_impl = {
@@ -867,6 +994,11 @@ static void xdg_ack(struct wl_client *client, struct wl_resource *resource, uint
     while (!wl_list_empty(&state->configures)) {
         record = wl_container_of(state->configures.next, record, link);
         bool last = record->serial == serial;
+        if (last && record->has_popup_geometry && xdg->role == PURP_XDG_ROLE_POPUP && xdg->popup) {
+            struct popup_state *popup = PURP_CONTAINER_OF(xdg->popup, struct popup_state, base);
+            popup->acked_geometry = record->popup_geometry;
+            popup->has_acked_geometry = true;
+        }
         wl_list_remove(&record->link); free(record);
         if (last) break;
     }
@@ -1049,7 +1181,7 @@ static void activation_serial(struct wl_client *client, struct wl_resource *reso
     struct activation_state *state = PURP_CONTAINER_OF(token, struct activation_state, base);
     token->serial = serial;
     token->has_serial = valid_seat(state->server, seat) &&
-                       purp_seat_validate_grab_serial(state->server, client, serial);
+                       purp_seat_validate_input_serial(state->server, client, serial);
 }
 
 static void activation_app_id(struct wl_client *client, struct wl_resource *resource, const char *app_id) {

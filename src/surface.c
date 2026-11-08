@@ -759,6 +759,7 @@ static bool subsurface_is_synchronized(const purp_subsurface_t *sub) {
 }
 
 static void subsurface_unlink(purp_subsurface_t *sub) {
+    purp_server_t *server = sub->parent ? sub->parent->server : NULL;
     wl_list_remove(&sub->link);
     wl_list_init(&sub->link);
     wl_list_remove(&sub->pending_link);
@@ -766,6 +767,7 @@ static void subsurface_unlink(purp_subsurface_t *sub) {
     wl_list_remove(&sub->parent_destroy.link);
     wl_list_init(&sub->parent_destroy.link);
     sub->parent = NULL;
+    if (server) purp_input_sync_pointer_focus(server, 0);
 }
 
 static void subsurface_handle_parent_destroy(struct wl_listener *listener, void *data) {
@@ -971,8 +973,21 @@ static const struct wl_subcompositor_interface subcompositor_impl = {
 /* Commit                                                                                     */
 /* =========================================================================================== */
 
+static bool subsurface_order_matches(struct wl_list *current, struct wl_list *pending) {
+    struct wl_list *link = current->next;
+    purp_subsurface_t *sub;
+    wl_list_for_each(sub, pending, pending_link) {
+        if (link == current || link != &sub->link) return false;
+        link = link->next;
+    }
+    return link == current;
+}
+
 /* Current stacking of `parent`'s children follows the pending stacking on parent commit. */
-static void surface_apply_subsurface_order(purp_surface_t *parent) {
+static bool surface_apply_subsurface_order(purp_surface_t *parent) {
+    if (subsurface_order_matches(&parent->subsurfaces_below, &parent->subsurfaces_pending_below) &&
+        subsurface_order_matches(&parent->subsurfaces_above, &parent->subsurfaces_pending_above))
+        return false;
     purp_subsurface_t *sub;
     wl_list_init(&parent->subsurfaces_below);
     wl_list_init(&parent->subsurfaces_above);
@@ -980,32 +995,35 @@ static void surface_apply_subsurface_order(purp_surface_t *parent) {
         wl_list_insert(parent->subsurfaces_below.prev, &sub->link);
     wl_list_for_each(sub, &parent->subsurfaces_pending_above, pending_link)
         wl_list_insert(parent->subsurfaces_above.prev, &sub->link);
+    return true;
 }
 
-static bool surface_apply(purp_surface_t *surface, purp_surface_state_t *state);
+static bool surface_apply(purp_surface_t *surface, purp_surface_state_t *state, bool *input_changed);
 
 /* A synchronized ancestor also latches descendant caches when an intermediate surface has no
  * cached commit. Its uncommitted position/stacking requests must stay pending. */
-static void subsurface_apply_synchronized_cache(purp_subsurface_t *sub) {
+static void subsurface_apply_synchronized_cache(purp_subsurface_t *sub, bool *input_changed) {
     if (!sub->surface || !subsurface_is_synchronized(sub)) return;
     if (sub->has_cache) {
         sub->has_cache = false;
-        surface_apply(sub->surface, &sub->cached);
+        surface_apply(sub->surface, &sub->cached, input_changed);
         return;
     }
     purp_subsurface_t *child, *tmp;
     wl_list_for_each_safe(child, tmp, &sub->surface->subsurfaces_below, link)
-        subsurface_apply_synchronized_cache(child);
+        subsurface_apply_synchronized_cache(child, input_changed);
     wl_list_for_each_safe(child, tmp, &sub->surface->subsurfaces_above, link)
-        subsurface_apply_synchronized_cache(child);
+        subsurface_apply_synchronized_cache(child, input_changed);
 }
 
-static void subsurface_parent_committed(purp_subsurface_t *sub) {
+static void subsurface_parent_committed(purp_subsurface_t *sub, bool *input_changed) {
     if (sub->position_pending) {
+        if (sub->position.x != sub->pending_position.x || sub->position.y != sub->pending_position.y)
+            *input_changed = true;
         sub->position = sub->pending_position;
         sub->position_pending = false;
     }
-    subsurface_apply_synchronized_cache(sub);
+    subsurface_apply_synchronized_cache(sub, input_changed);
 }
 
 /* wp_viewport rules checked when the state is applied; false after posting an error. */
@@ -1047,7 +1065,7 @@ static bool surface_validate_viewport(purp_surface_t *surface, const purp_surfac
 }
 
 /* state (pending or a subsurface cache) -> current; renderer, children and role hooks. */
-static bool surface_apply(purp_surface_t *surface, purp_surface_state_t *state) {
+static bool surface_apply(purp_surface_t *surface, purp_surface_state_t *state, bool *input_changed) {
     uint32_t bits = state->committed;
     if ((bits & PURP_SURFACE_STATE_BUFFER) && state->buffer &&
         state->buffer->kind == PURP_BUFFER_SHM && !state->buffer->resource) {
@@ -1066,6 +1084,8 @@ static bool surface_apply(purp_surface_t *surface, purp_surface_state_t *state) 
         buffer_size.h = state->buffer ? state->buffer->height : 0;
     }
     if (!surface_validate_viewport(surface, state, mapped, buffer_size)) return false;
+    bool was_mapped = surface->mapped;
+    purp_size_t old_size = surface->size;
 
     purp_surface_state_t *cur = &surface->current;
     purp_buffer_t *old_buffer = NULL;
@@ -1108,10 +1128,15 @@ static bool surface_apply(purp_surface_t *surface, purp_surface_state_t *state) 
     /* Only now: render.c may alias the previous buffer's texture until the call above. */
     if (old_buffer) purp_buffer_unlock(old_buffer);
 
-    surface_apply_subsurface_order(surface);
+    if (surface_apply_subsurface_order(surface)) *input_changed = true;
     purp_subsurface_t *sub, *tmp;
-    wl_list_for_each_safe(sub, tmp, &surface->subsurfaces_below, link) subsurface_parent_committed(sub);
-    wl_list_for_each_safe(sub, tmp, &surface->subsurfaces_above, link) subsurface_parent_committed(sub);
+    wl_list_for_each_safe(sub, tmp, &surface->subsurfaces_below, link)
+        subsurface_parent_committed(sub, input_changed);
+    wl_list_for_each_safe(sub, tmp, &surface->subsurfaces_above, link)
+        subsurface_parent_committed(sub, input_changed);
+    if (was_mapped != surface->mapped || old_size.w != surface->size.w ||
+        old_size.h != surface->size.h || (bits & PURP_SURFACE_STATE_INPUT_REGION))
+        *input_changed = true;
 
     if (surface->role && surface->role->commit) surface->role->commit(surface);
     wl_signal_emit_mutable(&surface->events_commit, surface);
@@ -1119,8 +1144,7 @@ static bool surface_apply(purp_surface_t *surface, purp_surface_state_t *state) 
 }
 
 /* Outputs, preferred scale and damage for the tree of a top-level applied commit. */
-static void surface_after_commit(purp_surface_t *surface, bool was_mapped, purp_size_t old_size,
-                                 bool input_changed) {
+static void surface_after_commit(purp_surface_t *surface, bool input_changed) {
     purp_server_t *server = surface->server;
     purp_surface_t *root = purp_surface_root(surface);
     int mon = surface_owner_monitor(server, root);
@@ -1128,11 +1152,8 @@ static void surface_after_commit(purp_surface_t *surface, bool was_mapped, purp_
     purp_surface_set_outputs(surface, mon >= 0 ? 1u << mon : 0);
     purp_surface_set_preferred_scale(surface, scale);
     surface_damage_root(server, root);
-    /* Role surfaces resync pointer focus in their commit hooks; subsurfaces do it here. */
-    bool changed = was_mapped != surface->mapped || old_size.w != surface->size.w ||
-                   old_size.h != surface->size.h || input_changed;
-    if (changed && surface->subsurface && surface->subsurface->parent)
-        purp_input_sync_pointer_focus(server, 0);
+    /* The applied commit can also map, move or restack synchronized descendants. */
+    if (input_changed) purp_input_sync_pointer_focus(server, 0);
 }
 
 /* Turning an ancestor desynchronized can make an entire branch effectively desynchronized.
@@ -1141,12 +1162,10 @@ static void subsurface_flush_desynchronized(purp_subsurface_t *sub) {
     if (!sub->surface || subsurface_is_synchronized(sub)) return;
     purp_surface_t *surface = sub->surface;
     if (sub->has_cache) {
-        bool was_mapped = surface->mapped;
-        purp_size_t old_size = surface->size;
-        bool input_changed = (sub->cached.committed & PURP_SURFACE_STATE_INPUT_REGION) != 0;
+        bool input_changed = false;
         sub->has_cache = false;
-        if (!surface_apply(surface, &sub->cached)) return;
-        surface_after_commit(surface, was_mapped, old_size, input_changed);
+        if (!surface_apply(surface, &sub->cached, &input_changed)) return;
+        surface_after_commit(surface, input_changed);
     }
     purp_subsurface_t *child, *tmp;
     wl_list_for_each_safe(child, tmp, &surface->subsurfaces_below, link)
@@ -1164,17 +1183,15 @@ static void surface_handle_commit(struct wl_client *client, struct wl_resource *
         sub->has_cache = true;
         return;
     }
-    bool was_mapped = surface->mapped;
-    purp_size_t old_size = surface->size;
     purp_surface_state_t *state = &surface->pending;
     if (sub && sub->has_cache) {
         state_merge(&sub->cached, &surface->pending);
         sub->has_cache = false;
         state = &sub->cached;
     }
-    bool input_changed = (state->committed & PURP_SURFACE_STATE_INPUT_REGION) != 0;
-    if (!surface_apply(surface, state)) return;
-    surface_after_commit(surface, was_mapped, old_size, input_changed);
+    bool input_changed = false;
+    if (!surface_apply(surface, state, &input_changed)) return;
+    surface_after_commit(surface, input_changed);
 }
 
 /* =========================================================================================== */

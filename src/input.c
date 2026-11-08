@@ -359,7 +359,8 @@ void purp_input_execute_action(purp_server_t *s, const purp_action_t *a, uint32_
     case PURP_ACTION_SPAWN_BLUETOOTH: spawn_list(s, PURP_COMMANDS(PURP_BLUETOOTH_COMMANDS), "Bluetooth manager"); return;
     case PURP_ACTION_TOGGLE_BLUETOOTH: purp_input_toggle_bluetooth_power(s); return;
     case PURP_ACTION_TOGGLE_SCRATCHPAD:
-        if (purp_wm_toggle_scratchpad(wm) == PURP_SCRATCHPAD_NEEDS_SPAWN) purp_server_spawn_terminal(s);
+        if (purp_wm_toggle_scratchpad(wm) == PURP_SCRATCHPAD_NEEDS_SPAWN &&
+            !purp_server_spawn_terminal(s)) wm->pending_scratchpad_spawn = false;
         break;
     case PURP_ACTION_LOCK_SCREEN: purp_server_lock_session(s); return;
     case PURP_ACTION_CLOSE_WINDOW:
@@ -471,21 +472,38 @@ void purp_host_keyboard_key(purp_server_t *s, uint32_t time, uint32_t keycode, b
     if (solo) purp_input_spawn_launcher(s);
 }
 
+static purp_layer_surface_t *popup_owner_layer(purp_popup_t *popup) {
+    for (int depth = 0; popup && depth < 1024; ++depth) {
+        if (!popup->committed || !popup->xdg->surface ||
+            !purp_surface_is_mapped(popup->xdg->surface)) return NULL;
+        if (popup->parent_layer) return popup->parent_layer;
+        if (!popup->parent_xdg || popup->parent_xdg->role != PURP_XDG_ROLE_POPUP) return NULL;
+        popup = popup->parent_xdg->popup;
+    }
+    return NULL;
+}
+
 void purp_input_sync_keyboard_focus(purp_server_t *s) {
     purp_surface_t *surface = NULL;
+    purp_layer_surface_t *layer = NULL;
+    purp_window_t *focused = NULL;
     if (!purp_server_is_locked(s)) {
-        purp_layer_surface_t *layer = purp_layer_keyboard_target(s);
+        layer = purp_layer_keyboard_target(s);
+        focused = purp_wm_focused_window(&s->wm);
         if (layer) surface = layer->surface;
-        else {
-            purp_window_t *win = purp_wm_focused_window(&s->wm);
-            if (win && purp_wm_is_window_visible(&s->wm, win)) surface = purp_xdg_window_surface(win);
-        }
+        else if (focused && focused->mapped && purp_wm_is_window_visible(&s->wm, focused))
+            surface = purp_xdg_window_surface(focused);
     }
     if (!wl_list_empty(&s->popup_grabs)) {
-        struct wl_client *client = surface ? wl_resource_get_client(surface->resource) : NULL;
         purp_popup_t *popup;
         wl_list_for_each(popup, &s->popup_grabs, grab_link) {
-            if (wl_resource_get_client(popup->xdg->surface->resource) != client) {
+            purp_window_t *owner = purp_xdg_window_for_surface(s, popup->xdg->surface);
+            bool valid = surface && popup->committed && popup->xdg->surface &&
+                purp_surface_is_mapped(popup->xdg->surface) &&
+                ((!layer && owner && owner == focused && owner->mapped &&
+                  purp_wm_is_window_visible(&s->wm, owner)) ||
+                 (layer && popup_owner_layer(popup) == layer && purp_layer_is_mapped(layer)));
+            if (!valid) {
                 purp_xdg_dismiss_popup_grabs(s);
                 break;
             }
@@ -507,11 +525,11 @@ static purp_surface_t *tree_at(purp_surface_t *root, purp_pointf_t pt,
     return surface;
 }
 
-purp_surface_t *purp_input_surface_under(purp_server_t *s, purp_pointf_t pt, purp_pointf_t *origin) {
-    if (origin) *origin = (purp_pointf_t){0};
-    if (purp_server_is_locked(s) || s->help.visible) return NULL;
-    purp_popup_t *popup = purp_xdg_popup_at(s, pt);
-    if (popup) {
+static purp_surface_t *root_popups_at(purp_server_t *s, purp_surface_t *root, purp_pointf_t pt,
+                                     purp_pointf_t *origin, purp_popup_t **popups, size_t capacity) {
+    size_t count = purp_xdg_popups_for_root(s, root, popups, capacity);
+    while (count) {
+        purp_popup_t *popup = popups[--count];
         purp_point_t loc = purp_xdg_popup_global_loc(popup);
         purp_xdg_surface_t *xdg = popup->xdg;
         purp_pointf_t base = {
@@ -520,13 +538,34 @@ purp_surface_t *purp_input_surface_under(purp_server_t *s, purp_pointf_t pt, pur
         purp_surface_t *hit = tree_at(xdg->surface, pt, base, origin);
         if (hit) return hit;
     }
-    purp_pointf_t layer_origin;
-    purp_layer_surface_t *layer = purp_layer_at(s, pt, &layer_origin);
-    if (layer) {
-        purp_surface_t *hit = tree_at(layer->surface, pt, layer_origin, origin);
+    return NULL;
+}
+
+static purp_surface_t *layer_level_at(purp_server_t *s, purp_pointf_t pt, uint32_t level,
+                                     purp_pointf_t *origin, purp_popup_t **popups, size_t capacity) {
+    purp_layer_surface_t *layer;
+    wl_list_for_each_reverse(layer, &s->layers, link) {
+        if (!purp_layer_is_mapped(layer) || purp_layer_is_keepalive(layer) ||
+            layer->current.layer != level || !layer->surface) continue;
+        purp_surface_t *hit = root_popups_at(s, layer->surface, pt, origin, popups, capacity);
+        if (!hit) hit = tree_at(layer->surface, pt,
+                                (purp_pointf_t){layer->geo.x, layer->geo.y}, origin);
         if (hit) return hit;
     }
-    /* The bar is drawn over windows, but never over top/overlay layers or popups. */
+    return NULL;
+}
+
+purp_surface_t *purp_input_surface_under(purp_server_t *s, purp_pointf_t pt, purp_pointf_t *origin) {
+    if (origin) *origin = (purp_pointf_t){0};
+    if (purp_server_is_locked(s) || s->help.visible) return NULL;
+    size_t capacity = (size_t)wl_list_length(&s->xdg_surfaces);
+    purp_popup_t *popups[capacity ? capacity : 1];
+    purp_surface_t *hit = layer_level_at(s, pt, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+                                        origin, popups, capacity);
+    if (!hit) hit = layer_level_at(s, pt, ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+                                   origin, popups, capacity);
+    if (hit) return hit;
+    /* The bar covers window trees and their popups, but stays below top/overlay layers. */
     size_t mon;
     int32_t local_x;
     if (purp_wm_bar_hit_monitor(&s->wm, pt, &mon, &local_x)) return NULL;
@@ -536,24 +575,57 @@ purp_surface_t *purp_input_surface_under(purp_server_t *s, purp_pointf_t pt, pur
         size_t n = purp_wm_stacking_order(&s->wm, order, count);
         for (size_t i = 0; i < n; ++i) {
             purp_window_t *win = s->wm.windows[order[i]];
-            if (!purp_rect_contains_f(win->geo, pt)) continue;
             purp_surface_t *root = purp_xdg_window_surface(win);
             if (!root) continue;
-            purp_point_t loc = purp_window_surface_loc(win);
-            purp_surface_t *hit = tree_at(root, pt, (purp_pointf_t){loc.x, loc.y}, origin);
+            hit = root_popups_at(s, root, pt, origin, popups, capacity);
             if (hit) return hit;
-            if (origin) *origin = (purp_pointf_t){loc.x, loc.y};
-            return root;
+            if (!purp_rect_contains_f(win->geo, pt)) continue;
+            purp_point_t loc = purp_window_surface_loc(win);
+            hit = tree_at(root, pt, (purp_pointf_t){loc.x, loc.y}, origin);
+            if (hit) return hit;
+            purp_point_t content = purp_window_content_loc(win);
+            purp_size_t size = purp_window_surface_size(win);
+            purp_rect_t inner = purp_rect_make(content.x, content.y, size.w, size.h);
+            if (!win->is_fullscreen && !purp_rect_contains_f(inner, pt)) {
+                if (origin) *origin = (purp_pointf_t){loc.x, loc.y};
+                return root;
+            }
         }
     }
-    wl_list_for_each_reverse(layer, &s->layers, link) {
-        if (!purp_layer_is_mapped(layer) || purp_layer_is_keepalive(layer) ||
-            purp_layer_is_above_windows(layer)) continue;
-        purp_surface_t *hit = tree_at(layer->surface, pt,
-                                      (purp_pointf_t){layer->geo.x, layer->geo.y}, origin);
-        if (hit) return hit;
+    hit = layer_level_at(s, pt, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, origin, popups, capacity);
+    if (!hit) hit = layer_level_at(s, pt, ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
+                                   origin, popups, capacity);
+    return hit;
+}
+
+static bool surface_global_origin(purp_server_t *s, purp_surface_t *surface,
+                                   purp_pointf_t *origin) {
+    if (!surface) return false;
+    purp_pointf_t offset = {0};
+    for (int depth = 0; surface->subsurface && depth < 1024; ++depth) {
+        purp_subsurface_t *sub = surface->subsurface;
+        if (!sub->parent) return false;
+        offset.x += sub->position.x;
+        offset.y += sub->position.y;
+        surface = sub->parent;
     }
-    return NULL;
+    if (surface->subsurface) return false;
+    purp_point_t base;
+    purp_xdg_surface_t *xdg = purp_xdg_surface_from_surface(surface);
+    if (xdg && xdg->role == PURP_XDG_ROLE_POPUP && xdg->popup) {
+        base = purp_xdg_popup_global_loc(xdg->popup);
+        base.x = input_clamp_i32((int64_t)base.x - (xdg->has_geometry ? xdg->geometry.x : 0));
+        base.y = input_clamp_i32((int64_t)base.y - (xdg->has_geometry ? xdg->geometry.y : 0));
+    } else if (surface->role && surface->role->kind == PURP_ROLE_LAYER && surface->role_data) {
+        purp_layer_surface_t *layer = surface->role_data;
+        base = purp_rect_loc(layer->geo);
+    } else {
+        purp_window_t *win = purp_xdg_window_for_surface(s, surface);
+        if (!win) return false;
+        base = purp_window_surface_loc(win);
+    }
+    *origin = (purp_pointf_t){base.x + offset.x, base.y + offset.y};
+    return true;
 }
 
 void purp_input_sync_pointer_focus(purp_server_t *s, uint32_t time) {
@@ -563,17 +635,32 @@ void purp_input_sync_pointer_focus(purp_server_t *s, uint32_t time) {
         purp_seat_pointer_focus(s, NULL, (purp_pointf_t){0}, time);
         return;
     }
-    if (s->grab.kind != PURP_GRAB_NONE || s->seat.pressed_button_count) return;
+    if (s->seat.pressed_button_count) {
+        purp_pointf_t origin;
+        if (surface_global_origin(s, s->seat.pointer_focus, &origin))
+            s->seat.pointer_focus_origin = origin;
+        return;
+    }
+    if (s->grab.kind != PURP_GRAB_NONE) return;
     purp_pointf_t origin;
     purp_surface_t *surface = purp_input_surface_under(s, s->wm.pointer_location, &origin);
     purp_seat_pointer_focus(s, surface, origin, time);
 }
 
-void purp_input_cancel_grabs(purp_server_t *s) {
+static bool clear_grab(purp_server_t *s) {
+    purp_window_t *win = purp_wm_window_by_id(&s->wm, s->grab.window_id);
+    bool resizing = win && win->is_resizing;
+    if (win) win->is_resizing = false;
     s->grab = (purp_interactive_grab_t){.touch_slot = -1};
     s->touch_grab_slot = -1;
+    return resizing;
+}
+
+void purp_input_cancel_grabs(purp_server_t *s) {
+    bool resizing = clear_grab(s);
     s->key_resize = (purp_key_resize_t){0};
     if (purp_seat_drag_active(s)) purp_seat_drag_cancel(s);
+    if (resizing) purp_server_relayout(s);
 }
 
 bool purp_input_tick_key_resize(purp_server_t *s) {
@@ -598,17 +685,30 @@ bool purp_input_tick_key_resize(purp_server_t *s) {
 }
 
 static bool begin_grab(purp_server_t *s, size_t idx, purp_pointf_t pos,
-                         bool resize, bool allow_tiled, uint32_t edges, bool forward, int32_t slot) {
+                         bool resize, bool allow_tiled, uint32_t edges, bool forward,
+                         int32_t slot, uint32_t button) {
+    if (idx >= s->wm.window_count) return false;
     purp_window_t *win = s->wm.windows[idx];
-    if (win->is_fullscreen) return false;
+    if (!win->mapped || win->is_fullscreen) return false;
     purp_interactive_grab_t grab = {.window_id = win->id, .start_pointer = pos,
-        .edges = edges, .forward_release = forward, .touch_slot = slot};
+        .edges = edges, .forward_release = forward, .touch_slot = slot, .button = button};
     if (resize && allow_tiled && purp_wm_tiled_resize_plan(&s->wm, idx, edges, &grab.plan)) {
+        purp_workspace_t *ws = &s->wm.monitors[grab.plan.monitor].workspace;
         grab.kind = PURP_GRAB_TILED_RESIZE;
+        grab.plan_tags = ws->selected_tags;
+        grab.plan_layout = purp_workspace_layout(ws);
+    } else if (!resize && (win->is_maximized ||
+               (!win->is_floating && !win->is_scratchpad && win->monitor >= 0 &&
+                (size_t)win->monitor < s->wm.monitor_count &&
+                purp_workspace_layout(&s->wm.monitors[win->monitor].workspace) != PURP_LAYOUT_FLOATING))) {
+        grab.kind = PURP_GRAB_MOVE;
+        grab.pending_float = true;
+        grab.start_geo = win->geo;
     } else {
         if (!purp_wm_floating_grab_geometry(&s->wm, idx, &grab.start_geo)) return false;
         grab.kind = resize ? PURP_GRAB_RESIZE : PURP_GRAB_MOVE;
     }
+    win->is_resizing = resize;
     s->grab = grab;
     s->touch_grab_slot = slot;
     purp_server_relayout(s);
@@ -630,10 +730,10 @@ void purp_input_begin_client_grab(purp_server_t *s, purp_toplevel_t *top,
     purp_pointf_t pos = s->wm.pointer_location;
     bool pointer = serial == s->seat.last_button_serial && s->seat.pressed_button_count &&
         purp_xdg_window_for_surface(s, s->seat.pointer_focus) == top->window;
-    if (!pointer && serial == s->seat.last_touch_serial) {
+    if (!pointer) {
         for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i) {
             purp_touch_point_t *touch = &s->seat.touch[i];
-            if (touch->active && touch->surface &&
+            if (touch->active && touch->down_serial == serial && touch->surface &&
                 purp_xdg_window_for_surface(s, touch->surface) == top->window) {
                 slot = touch->slot;
                 pos = touch->pos;
@@ -643,16 +743,48 @@ void purp_input_begin_client_grab(purp_server_t *s, purp_toplevel_t *top,
     }
     if (!pointer && slot < 0) return;
     purp_wm_focus_window(&s->wm, idx);
-    begin_grab(s, (size_t)idx, pos, resize, true, edges, true, slot);
+    uint32_t button = pointer ? s->seat.pressed_buttons[s->seat.pressed_button_count - 1] : 0;
+    begin_grab(s, (size_t)idx, pos, resize, true, edges, true, slot, button);
 }
 
 static bool update_grab(purp_server_t *s, purp_pointf_t pos) {
     purp_interactive_grab_t *grab = &s->grab;
     if (grab->kind == PURP_GRAB_NONE) return false;
     purp_window_t *win = purp_wm_window_by_id(&s->wm, grab->window_id);
-    if (!win || win->is_fullscreen) {
+    if (!win || !win->mapped || win->is_fullscreen || !purp_wm_is_window_visible(&s->wm, win)) {
         purp_input_cancel_grabs(s);
         return true;
+    }
+    if (grab->kind == PURP_GRAB_TILED_RESIZE) {
+        int mon = grab->plan.monitor;
+        if (mon < 0 || (size_t)mon >= s->wm.monitor_count || win->monitor != mon ||
+            !s->wm.monitors[mon].enabled ||
+            s->wm.monitors[mon].workspace.selected_tags != grab->plan_tags ||
+            purp_workspace_layout(&s->wm.monitors[mon].workspace) != grab->plan_layout) {
+            purp_input_cancel_grabs(s);
+            return true;
+        }
+    }
+    if (grab->pending_float) {
+        if (hypot(pos.x - grab->start_pointer.x, pos.y - grab->start_pointer.y) < 10.0) return true;
+        int idx = purp_wm_window_index(&s->wm, win);
+        if (idx < 0) {
+            purp_input_cancel_grabs(s);
+            return true;
+        }
+        if (win->is_maximized) {
+            purp_wm_set_window_maximized(&s->wm, (size_t)idx, false);
+            win->is_floating = true;
+            grab->start_geo = win->float_geo;
+            grab->start_geo.x = purp_round_i32(pos.x - win->float_geo.w / 2.0);
+            grab->start_geo.y = purp_round_i32(pos.y - 16);
+            grab->start_pointer = pos;
+            win->geo = win->float_geo = grab->start_geo;
+        } else if (!purp_wm_floating_grab_geometry(&s->wm, (size_t)idx, &grab->start_geo)) {
+            purp_input_cancel_grabs(s);
+            return true;
+        }
+        grab->pending_float = false;
     }
     int32_t dx = purp_round_i32(pos.x - grab->start_pointer.x);
     int32_t dy = purp_round_i32(pos.y - grab->start_pointer.y);
@@ -669,7 +801,8 @@ static bool update_grab(purp_server_t *s, purp_pointf_t pos) {
         win->size_from_client = false;
         win->geo = win->float_geo = wanted;
     } else {
-        purp_point_t loc = {grab->start_geo.x + dx, grab->start_geo.y + dy};
+        purp_point_t loc = {input_clamp_i32((int64_t)grab->start_geo.x + dx),
+                            input_clamp_i32((int64_t)grab->start_geo.y + dy)};
         loc = purp_clamp_floating_loc_across_monitors(loc, purp_rect_size(grab->start_geo),
                                                        s->wm.monitors, s->wm.monitor_count);
         win->geo.x = win->float_geo.x = loc.x;
@@ -686,6 +819,25 @@ static bool update_grab(purp_server_t *s, purp_pointf_t pos) {
     }
     purp_server_relayout(s);
     return true;
+}
+
+static void finish_grab(purp_server_t *s, purp_pointf_t pos) {
+    int idx = purp_wm_window_index_by_id(&s->wm, s->grab.window_id);
+    if (idx >= 0 && s->grab.kind == PURP_GRAB_MOVE && !s->grab.pending_float) {
+        purp_window_t *win = s->wm.windows[idx];
+        int mon = purp_wm_monitor_at(&s->wm, pos);
+        if (win->mapped && win->is_floating && !win->is_scratchpad &&
+            !win->is_fullscreen && purp_wm_is_window_visible(&s->wm, win) && mon >= 0) {
+            purp_rect_t rect = purp_wm_monitor_rect(&s->wm, (size_t)mon);
+            if (pos.y <= (double)rect.y + PURP_BAR_HEIGHT + 8) {
+                if (win->monitor != mon)
+                    purp_wm_send_window_to_monitor(&s->wm, (size_t)idx, (size_t)mon, true);
+                win->is_floating = false;
+                purp_wm_set_window_maximized(&s->wm, (size_t)idx, true);
+            }
+        }
+    }
+    clear_grab(s);
 }
 
 void purp_input_handle_bar_click(purp_server_t *s, size_t mon, int32_t x, uint32_t button) {
@@ -735,15 +887,31 @@ void purp_input_handle_bar_click(purp_server_t *s, size_t mon, int32_t x, uint32
     purp_server_relayout(s);
 }
 
+static bool surface_is_popup(purp_surface_t *surface) {
+    purp_surface_t *root = surface ? purp_surface_root(surface) : NULL;
+    return root && root->role && root->role->kind == PURP_ROLE_XDG_POPUP;
+}
+
+static purp_layer_surface_t *surface_layer(purp_surface_t *surface) {
+    purp_surface_t *root = surface ? purp_surface_root(surface) : NULL;
+    return root && root->role && root->role->kind == PURP_ROLE_LAYER ? root->role_data : NULL;
+}
+
+static int surface_window_index(purp_server_t *s, purp_surface_t *surface) {
+    purp_window_t *win = purp_xdg_window_for_surface(s, surface);
+    return win ? purp_wm_window_index(&s->wm, win) : -1;
+}
+
 static void pointer_motion(purp_server_t *s, uint32_t time, purp_pointf_t pos) {
-    int old_hovered = purp_wm_window_at(&s->wm, s->wm.pointer_location);
     s->wm.pointer_location = pos;
     if (purp_server_is_locked(s)) {
+        s->hovered_window_id = 0;
         if (purp_seat_drag_active(s)) purp_seat_drag_cancel(s);
         return;
     }
     purp_host_damage_all(s);
     if (s->help.visible) {
+        s->hovered_window_id = 0;
         if (purp_wm_focus_monitor_at_point(&s->wm, pos)) purp_server_relayout(s);
         purp_input_sync_pointer_focus(s, time);
         return;
@@ -754,20 +922,23 @@ static void pointer_motion(purp_server_t *s, uint32_t time, purp_pointf_t pos) {
     }
     if (s->grab.touch_slot < 0 && update_grab(s, pos)) return;
     if (s->seat.pressed_button_count || s->grab.kind != PURP_GRAB_NONE) {
+        s->hovered_window_id = 0;
+        purp_input_sync_pointer_focus(s, time);
         purp_seat_pointer_send_motion(s, time);
         return;
     }
-    purp_popup_t *popup = purp_xdg_popup_at(s, pos);
+    purp_surface_t *under = purp_input_surface_under(s, pos, NULL);
+    bool popup = surface_is_popup(under);
     bool popup_grabbed = !wl_list_empty(&s->popup_grabs);
     bool switched = !popup_grabbed && !popup && purp_wm_focus_monitor_at_point(&s->wm, pos);
     bool changed = switched;
-    purp_pointf_t origin;
-    size_t mon;
-    int32_t x;
-    if (!popup_grabbed && !popup && !purp_layer_at(s, pos, &origin) &&
-        !purp_wm_bar_hit_monitor(&s->wm, pos, &mon, &x)) {
-        int idx = purp_wm_window_at(&s->wm, pos);
-        if (idx >= 0 && (idx != old_hovered || switched)) {
+    int idx = !popup_grabbed && !popup && !surface_layer(under) ?
+        surface_window_index(s, under) : -1;
+    if (idx < 0) s->hovered_window_id = 0;
+    else {
+        purp_window_t *win = s->wm.windows[idx];
+        if (win->id != s->hovered_window_id || switched) {
+            s->hovered_window_id = win->id;
             s->layer_focus = NULL;
             purp_wm_focus_window(&s->wm, idx);
             changed = true;
@@ -815,11 +986,11 @@ static bool dismiss_notification(purp_server_t *s, purp_pointf_t pos) {
     return hit;
 }
 
-static void focus_clicked_window(purp_server_t *s, purp_pointf_t pos) {
+static void focus_clicked_window(purp_server_t *s, purp_pointf_t pos, int idx) {
     s->layer_focus = NULL;
     bool changed = purp_wm_focus_monitor_at_point(&s->wm, pos);
-    int idx = purp_wm_window_at(&s->wm, pos);
     if (idx >= 0 && (changed || idx != s->wm.focused_idx)) {
+        s->hovered_window_id = s->wm.windows[idx]->id;
         purp_wm_focus_window(&s->wm, idx);
         changed = true;
     }
@@ -866,15 +1037,21 @@ void purp_host_pointer_button(purp_server_t *s, uint32_t time, uint32_t button, 
         }
         return;
     }
-    if (pressed && s->grab.kind != PURP_GRAB_NONE && s->grab.touch_slot < 0) {
-        s->grab.kind = PURP_GRAB_NONE;
-        s->touch_grab_slot = -1;
-        purp_server_relayout(s);
-    }
-    if (!pressed && s->grab.kind != PURP_GRAB_NONE && s->grab.touch_slot < 0) {
+    if (s->grab.kind != PURP_GRAB_NONE) {
+        if (s->grab.touch_slot >= 0 || button != s->grab.button) {
+            if (pressed) swallow_button(s, button);
+            else if (!swallowed) {
+                for (size_t i = 0; i < s->seat.pressed_button_count; ++i) {
+                    if (s->seat.pressed_buttons[i] != button) continue;
+                    forward_button(s, time, button, false);
+                    break;
+                }
+            }
+            return;
+        }
+        if (pressed) return;
         bool forward = s->grab.forward_release;
-        s->grab.kind = PURP_GRAB_NONE;
-        s->touch_grab_slot = -1;
+        finish_grab(s, s->wm.pointer_location);
         if (forward) forward_button(s, time, button, false);
         purp_server_relayout(s);
         return;
@@ -892,12 +1069,12 @@ void purp_host_pointer_button(purp_server_t *s, uint32_t time, uint32_t button, 
         return;
     }
     if (pressed) dismiss_outside_popups(s, pos);
-    if (purp_xdg_popup_at(s, pos)) {
+    purp_surface_t *under = purp_input_surface_under(s, pos, NULL);
+    if (surface_is_popup(under)) {
         forward_button(s, time, button, pressed);
         return;
     }
-    purp_pointf_t origin;
-    purp_layer_surface_t *layer = purp_layer_at(s, pos, &origin);
+    purp_layer_surface_t *layer = surface_layer(under);
     if (layer) {
         if (pressed) focus_layer(s, layer);
         forward_button(s, time, button, pressed);
@@ -912,7 +1089,7 @@ void purp_host_pointer_button(purp_server_t *s, uint32_t time, uint32_t button, 
     }
     if (pressed && purp_mods_has_mod(s->seat.modifiers) &&
         (button == PURP_BTN_LEFT || button == PURP_BTN_RIGHT || button == PURP_BTN_MIDDLE)) {
-        int idx = purp_wm_window_at(&s->wm, pos);
+        int idx = surface_window_index(s, under);
         if (idx >= 0) {
             purp_wm_focus_window(&s->wm, idx);
             s->layer_focus = NULL;
@@ -930,13 +1107,14 @@ void purp_host_pointer_button(purp_server_t *s, uint32_t time, uint32_t button, 
                     purp_wm_tiled_resize_plan(&s->wm, (size_t)idx, nearest, &plan);
                 if (allow_tiled) edges = nearest;
                 /* A missing nearest split must float, not retry the far bottom/right split. */
-                if (!begin_grab(s, (size_t)idx, pos, button == PURP_BTN_RIGHT, allow_tiled, edges, false, -1))
+                if (!begin_grab(s, (size_t)idx, pos, button == PURP_BTN_RIGHT,
+                                allow_tiled, edges, false, -1, button))
                     purp_server_relayout(s);
             }
             return;
         }
     }
-    if (pressed) focus_clicked_window(s, pos);
+    if (pressed) focus_clicked_window(s, pos, surface_window_index(s, under));
     forward_button(s, time, button, pressed);
 }
 
@@ -951,12 +1129,12 @@ void purp_host_pointer_axis(purp_server_t *s, const purp_axis_event_t *event) {
         axis.has_horizontal = true;
         axis.horizontal = axis.horizontal_v120 * PURP_BAR_SCROLL_STEP / 120.0;
     }
-    purp_pointf_t origin, pos = s->wm.pointer_location;
+    purp_pointf_t pos = s->wm.pointer_location;
     size_t mon;
     int32_t x;
     if (!purp_seat_drag_active(s) && !s->seat.pressed_button_count &&
-        s->grab.kind == PURP_GRAB_NONE && !purp_xdg_popup_at(s, pos) &&
-        !purp_layer_at(s, pos, &origin) && purp_wm_bar_hit_monitor(&s->wm, pos, &mon, &x)) {
+        s->grab.kind == PURP_GRAB_NONE && purp_wm_bar_hit_monitor(&s->wm, pos, &mon, &x) &&
+        !purp_input_surface_under(s, pos, NULL)) {
         s->bar_scroll_accum += axis.vertical;
         while (fabs(s->bar_scroll_accum) >= PURP_BAR_SCROLL_STEP) {
             int dir = s->bar_scroll_accum > 0 ? 1 : -1;
@@ -1014,9 +1192,9 @@ void purp_host_touch_down(purp_server_t *s, uint32_t time, int32_t slot, double 
         return;
     }
     dismiss_outside_popups(s, pos);
-    if (purp_xdg_popup_at(s, pos)) { forward_touch_down(s, time, slot, pos); return; }
-    purp_pointf_t origin;
-    purp_layer_surface_t *layer = purp_layer_at(s, pos, &origin);
+    purp_surface_t *under = purp_input_surface_under(s, pos, NULL);
+    if (surface_is_popup(under)) { forward_touch_down(s, time, slot, pos); return; }
+    purp_layer_surface_t *layer = surface_layer(under);
     if (layer) {
         focus_layer(s, layer);
         forward_touch_down(s, time, slot, pos);
@@ -1029,12 +1207,12 @@ void purp_host_touch_down(purp_server_t *s, uint32_t time, int32_t slot, double 
         purp_input_handle_bar_click(s, mon, local_x, PURP_BTN_LEFT);
         return;
     }
-    focus_clicked_window(s, pos);
+    int idx = surface_window_index(s, under);
+    focus_clicked_window(s, pos, idx);
     if (purp_mods_has_mod(s->seat.modifiers) && s->grab.kind == PURP_GRAB_NONE) {
-        int idx = purp_wm_window_at(&s->wm, pos);
         if (idx >= 0) {
             swallow_touch(s, slot);
-            begin_grab(s, (size_t)idx, pos, false, true, 0, false, slot);
+            begin_grab(s, (size_t)idx, pos, false, true, 0, false, slot, 0);
             return;
         }
     }
@@ -1067,8 +1245,8 @@ void purp_host_touch_up(purp_server_t *s, uint32_t time, int32_t slot) {
     bool forward = !swallowed;
     if (s->grab.kind != PURP_GRAB_NONE && s->grab.touch_slot == slot) {
         forward = s->grab.forward_release;
-        s->grab = (purp_interactive_grab_t){.touch_slot = -1};
-        s->touch_grab_slot = -1;
+        purp_touch_point_t *point = purp_seat_touch_point(s, slot);
+        finish_grab(s, point ? point->pos : s->wm.pointer_location);
         purp_server_relayout(s);
     }
     if (purp_server_is_locked(s) || s->help.visible) return;
@@ -1083,8 +1261,7 @@ void purp_host_touch_up(purp_server_t *s, uint32_t time, int32_t slot) {
 void purp_host_touch_cancel(purp_server_t *s, int32_t slot) {
     remove_touch(s, slot);
     if (s->grab.kind != PURP_GRAB_NONE && s->grab.touch_slot == slot) {
-        s->grab = (purp_interactive_grab_t){.touch_slot = -1};
-        s->touch_grab_slot = -1;
+        clear_grab(s);
         purp_server_relayout(s);
     }
     if (purp_seat_drag_active(s) && s->seat.drag.is_touch && s->seat.drag.touch_slot == slot)

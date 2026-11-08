@@ -792,8 +792,26 @@ void purp_render_border(purp_renderer_t *renderer, purp_rect_t geo, int32_t widt
                                                      monitor_origin, scale), color);
 }
 
+static void render_popups_for_root(purp_server_t *server, purp_surface_t *root,
+                                   purp_popup_t **popups, size_t capacity,
+                                   purp_point_t origin, double scale) {
+    size_t count = purp_xdg_popups_for_root(server, root, popups, capacity);
+    for (size_t i = 0; i < count; ++i) {
+        purp_popup_t *popup = popups[i];
+        purp_point_t loc = purp_xdg_popup_global_loc(popup);
+        if (popup->xdg->has_geometry) {
+            loc.x = render_clamp_i32((int64_t)loc.x - popup->xdg->geometry.x);
+            loc.y = render_clamp_i32((int64_t)loc.y - popup->xdg->geometry.y);
+        }
+        purp_render_surface_tree(server->renderer, popup->xdg->surface,
+                                  (purp_pointf_t){loc.x, loc.y}, origin, scale,
+                                  PURP_OPACITY_POPUP, NULL);
+    }
+}
+
 static void render_layers(purp_server_t *server, size_t mon, uint32_t level,
-                          purp_point_t origin, double scale, float alpha) {
+                          purp_point_t origin, double scale, float alpha,
+                          purp_popup_t **popups, size_t popup_capacity) {
     purp_layer_surface_t *layer;
     wl_list_for_each(layer, &server->layers, link) {
         if (layer->monitor != (int)mon || layer->current.layer != level ||
@@ -801,6 +819,7 @@ static void render_layers(purp_server_t *server, size_t mon, uint32_t level,
         purp_render_surface_tree(server->renderer, layer->surface,
                                   (purp_pointf_t){layer->geo.x, layer->geo.y}, origin,
                                   scale, alpha, NULL);
+        render_popups_for_root(server, layer->surface, popups, popup_capacity, origin, scale);
     }
 }
 
@@ -808,6 +827,22 @@ static void render_raster_at(purp_renderer_t *renderer, const purp_pixel_buf_t *
                              int32_t x, int32_t y) {
     if (raster)
         purp_render_pixel_buf(renderer, raster, purp_rect_make(x, y, raster->width, raster->height), 1);
+}
+
+struct cursor_overlap_data {
+    purp_pointf_t origin;
+    purp_rect_t monitor;
+    bool overlaps;
+};
+
+static bool cursor_surface_overlaps(purp_surface_t *surface, int32_t x, int32_t y, void *data) {
+    struct cursor_overlap_data *cursor = data;
+    double left = cursor->origin.x + x, top = cursor->origin.y + y;
+    purp_rect_t monitor = cursor->monitor;
+    cursor->overlaps = surface->size.w > 0 && surface->size.h > 0 &&
+        left < (double)monitor.x + monitor.w && left + surface->size.w > monitor.x &&
+        top < (double)monitor.y + monitor.h && top + surface->size.h > monitor.y;
+    return !cursor->overlaps;
 }
 
 bool purp_render_monitor_frame(purp_server_t *server, size_t mon, int32_t fb_width,
@@ -828,32 +863,43 @@ bool purp_render_monitor_frame(purp_server_t *server, size_t mon, int32_t fb_wid
     }
     purp_render_clear(renderer, PURP_COLOR_BG_ROOT);
     render_raster_at(renderer, purp_wallpaper_get(&server->wallpaper, fb_width, fb_height), 0, 0);
-    render_layers(server, mon, ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, origin, scale, 1);
-    render_layers(server, mon, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, origin, scale, 1);
     struct renderer_storage *storage = (struct renderer_storage *)renderer;
     size_t order_count = server->wm.window_count;
     size_t popup_capacity = (size_t)wl_list_length(&server->xdg_surfaces);
-    if (order_count > SIZE_MAX / sizeof(size_t) ||
+    size_t popup_alignment = _Alignof(purp_popup_t *);
+    if (order_count > (SIZE_MAX - (popup_alignment - 1)) / sizeof(size_t) ||
         popup_capacity > SIZE_MAX / sizeof(purp_popup_t *)) {
         purp_render_end(renderer);
         return false;
     }
     size_t order_bytes = order_count * sizeof(size_t);
+    size_t popup_offset = order_bytes + (popup_alignment - order_bytes % popup_alignment) %
+        popup_alignment;
     size_t popup_bytes = popup_capacity * sizeof(purp_popup_t *);
-    if (!reserve_bytes(&storage->composition_scratch, &storage->composition_capacity,
-                       order_bytes > popup_bytes ? order_bytes : popup_bytes)) {
+    if (popup_bytes > SIZE_MAX - popup_offset ||
+        !reserve_bytes(&storage->composition_scratch, &storage->composition_capacity,
+                       popup_offset + popup_bytes)) {
         purp_render_end(renderer);
         return false;
     }
     size_t *order = (size_t *)storage->composition_scratch;
+    purp_popup_t **popups = popup_capacity ?
+        (purp_popup_t **)(storage->composition_scratch + popup_offset) : NULL;
+    render_layers(server, mon, ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, origin, scale, 1,
+                  popups, popup_capacity);
+    render_layers(server, mon, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, origin, scale, 1,
+                  popups, popup_capacity);
     size_t count = purp_wm_stacking_order(&server->wm, order, order_count);
     purp_rect_t visible = purp_rect_inflate(purp_monitor_rect(monitor), PURP_BORDER_WIDTH + 4);
     for (size_t n = count; n > 0; --n) {
         size_t index = order[n - 1];
         purp_window_t *window = server->wm.windows[index];
-        if (!purp_rect_overlaps(window->geo, visible)) continue;
         purp_surface_t *surface = purp_xdg_window_surface(window);
         if (!surface) continue;
+        if (!purp_rect_overlaps(window->geo, visible)) {
+            render_popups_for_root(server, surface, popups, popup_capacity, origin, scale);
+            continue;
+        }
         bool focused = (int)index == server->wm.focused_idx;
         if (window->is_fullscreen)
             purp_render_rect(renderer, monitor_physical_rect(window->geo, origin, scale),
@@ -873,8 +919,16 @@ bool purp_render_monitor_frame(purp_server_t *server, size_t mon, int32_t fb_wid
         purp_rect_t clip = monitor_physical_rect(purp_rect_make(content.x, content.y,
             content_size.w, content_size.h), origin, scale);
         purp_point_t surface_loc = purp_window_surface_loc(window);
+        purp_size_t client_size;
+        if (window->is_fullscreen && purp_window_client_geometry_size(window, &client_size)) {
+            surface_loc.x = render_clamp_i32((int64_t)surface_loc.x +
+                purp_max_i32(window->geo.w - client_size.w, 0) / 2);
+            surface_loc.y = render_clamp_i32((int64_t)surface_loc.y +
+                purp_max_i32(window->geo.h - client_size.h, 0) / 2);
+        }
         purp_render_surface_tree(renderer, surface, (purp_pointf_t){surface_loc.x, surface_loc.y},
                                   origin, scale, alpha, &clip);
+        render_popups_for_root(server, surface, popups, popup_capacity, origin, scale);
     }
     bool bar_visible = purp_wm_bar_visible_on(&server->wm, mon);
     if (bar_visible) {
@@ -884,20 +938,10 @@ bool purp_render_monitor_frame(purp_server_t *server, size_t mon, int32_t fb_wid
         render_raster_at(renderer, purp_bar_render(&server->bar, mon, monitor->logical_size.w,
                                                    scale, &inputs), 0, 0);
     }
-    render_layers(server, mon, ZWLR_LAYER_SHELL_V1_LAYER_TOP, origin, scale, PURP_OPACITY_POPUP);
-    render_layers(server, mon, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, origin, scale, PURP_OPACITY_POPUP);
-    purp_popup_t **popups = (purp_popup_t **)storage->composition_scratch;
-    size_t popup_count = purp_xdg_visible_popups(server, (int)mon, popups, popup_capacity);
-    for (size_t i = 0; i < popup_count; ++i) {
-        purp_popup_t *popup = popups[i];
-        purp_point_t loc = purp_xdg_popup_global_loc(popup);
-        if (popup->xdg->has_geometry) {
-            loc.x = render_clamp_i32((int64_t)loc.x - popup->xdg->geometry.x);
-            loc.y = render_clamp_i32((int64_t)loc.y - popup->xdg->geometry.y);
-        }
-        purp_render_surface_tree(renderer, popup->xdg->surface, (purp_pointf_t){loc.x, loc.y},
-                                  origin, scale, PURP_OPACITY_POPUP, NULL);
-    }
+    render_layers(server, mon, ZWLR_LAYER_SHELL_V1_LAYER_TOP, origin, scale, PURP_OPACITY_POPUP,
+                  popups, popup_capacity);
+    render_layers(server, mon, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, origin, scale, PURP_OPACITY_POPUP,
+                  popups, popup_capacity);
     if (mon == purp_wm_active_monitor_index(&server->wm)) {
         purp_point_t at = {0, 0};
         const purp_pixel_buf_t *raster = purp_notify_render(&server->notify, server->font,
@@ -907,23 +951,36 @@ bool purp_render_monitor_frame(purp_server_t *server, size_t mon, int32_t fb_wid
         render_raster_at(renderer, raster, at.x, at.y);
     }
     purp_pointf_t pointer = server->wm.pointer_location;
-    if (server->seat.drag.active && server->seat.drag.icon)
-        purp_render_surface_tree(renderer, server->seat.drag.icon, pointer, origin, scale,
+    if (server->seat.drag.active && server->seat.drag.icon) {
+        purp_pointf_t icon_origin = {
+            pointer.x + server->seat.drag.drag_icon_offset.x,
+            pointer.y + server->seat.drag.drag_icon_offset.y
+        };
+        purp_render_surface_tree(renderer, server->seat.drag.icon, icon_origin, origin, scale,
                                   PURP_OPACITY_DND_ICON, NULL);
-    if (!hide_cursor && server->seat.cursor_mode != PURP_CURSOR_MODE_HIDDEN &&
-        purp_rect_contains_f(purp_rect_inflate(purp_monitor_rect(monitor),
-                                              PURP_RENDER_CURSOR_MARGIN), pointer)) {
+    }
+    if (!hide_cursor && server->seat.cursor_mode != PURP_CURSOR_MODE_HIDDEN) {
         if (server->seat.cursor_mode == PURP_CURSOR_MODE_SURFACE && server->seat.cursor_surface) {
             pointer.x -= server->seat.cursor_hotspot.x;
             pointer.y -= server->seat.cursor_hotspot.y;
-            purp_render_surface_tree(renderer, server->seat.cursor_surface, pointer, origin, scale, 1, NULL);
+            struct cursor_overlap_data cursor = {
+                .origin = pointer, .monitor = purp_monitor_rect(monitor)
+            };
+            purp_surface_for_each(server->seat.cursor_surface, cursor_surface_overlaps, &cursor);
+            if (cursor.overlaps)
+                purp_render_surface_tree(renderer, server->seat.cursor_surface, pointer,
+                                          origin, scale, 1, NULL);
         } else {
             const purp_cursor_image_t *cursor = purp_cursor_theme_get(&server->cursor_theme,
                 server->seat.cursor_shape ? server->seat.cursor_shape : PURP_CURSOR_DEFAULT, scale);
-            if (cursor)
-                render_raster_at(renderer, &cursor->buffer,
+            if (cursor) {
+                purp_rect_t bounds = purp_rect_make(
                     purp_round_i32((pointer.x - origin.x) * scale) - cursor->hotspot_x,
-                    purp_round_i32((pointer.y - origin.y) * scale) - cursor->hotspot_y);
+                    purp_round_i32((pointer.y - origin.y) * scale) - cursor->hotspot_y,
+                    cursor->buffer.width, cursor->buffer.height);
+                if (purp_rect_overlaps(bounds, purp_rect_make(0, 0, fb_width, fb_height)))
+                    render_raster_at(renderer, &cursor->buffer, bounds.x, bounds.y);
+            }
         }
     }
     purp_render_end(renderer);

@@ -665,6 +665,292 @@ static void test_pointer_clamping_crosses_seams_without_snag(void) {
     CHECK(edge.x < 1707.0 + 1920.0 && edge.x > 1707.0 + 1919.0);
 }
 
+/* Server toplevel sentinels are never dereferenced by the pure WM model. */
+static purp_toplevel_t *test_server_toplevel(void) {
+    return (purp_toplevel_t *)(uintptr_t)1;
+}
+
+static void test_window_wm_init(purp_wm_t *wm) {
+    purp_wm_init(wm, 1.0);
+    purp_monitor_desc_t desc = test_monitor_desc("WM-1", 1000, 800, 60000, 1, 0, 0);
+    CHECK(purp_wm_add_monitor(wm, &desc) == 0);
+    wm->monitors[0].workspace.gaps_enabled = false;
+}
+
+static void test_unmapped_toplevels_enter_and_leave_the_wm(void) {
+    purp_wm_t wm;
+    test_window_wm_init(&wm);
+    purp_window_t *pending = purp_wm_window_create(&wm, test_server_toplevel());
+    CHECK(pending != NULL);
+    if (!pending) { purp_wm_finish(&wm); return; }
+    CHECK(!pending->mapped && wm.focused_idx == -1);
+    CHECK(!purp_wm_is_window_visible(&wm, pending));
+    size_t indices[2] = {0};
+    CHECK(purp_workspace_tiled_indices(&wm.monitors[0].workspace, wm.windows,
+        wm.window_count, 0, indices, PURP_ARRAY_LEN(indices)) == 0);
+    CHECK(purp_wm_stacking_order(&wm, indices, PURP_ARRAY_LEN(indices)) == 0);
+    purp_wm_window_destroy(&wm, pending);
+
+    purp_window_t *existing = purp_wm_window_create(&wm, NULL);
+    CHECK(existing != NULL);
+    if (!existing) { purp_wm_finish(&wm); return; }
+    purp_wm_relayout(&wm);
+    purp_rect_t existing_frame = existing->geo;
+    pending = purp_wm_window_create(&wm, test_server_toplevel());
+    CHECK(pending != NULL);
+    if (!pending) { purp_wm_finish(&wm); return; }
+    purp_wm_relayout(&wm);
+    CHECK(purp_wm_focused_window(&wm) == existing);
+    CHECK(wm.focused_idx == purp_wm_window_index(&wm, existing));
+    CHECK(purp_rect_eq(existing->geo, existing_frame));
+    CHECK(purp_workspace_tiled_indices(&wm.monitors[0].workspace, wm.windows,
+        wm.window_count, 0, indices, PURP_ARRAY_LEN(indices)) == 1);
+    CHECK(wm.windows[indices[0]] == existing);
+    CHECK(purp_wm_stacking_order(&wm, indices, PURP_ARRAY_LEN(indices)) == 1);
+    CHECK(wm.windows[indices[0]] == existing);
+
+    purp_wm_on_window_mapped(&wm, (size_t)purp_wm_window_index(&wm, pending));
+    purp_wm_relayout(&wm);
+    CHECK(pending->mapped && purp_wm_focused_window(&wm) == pending);
+    CHECK(purp_wm_is_window_visible(&wm, pending));
+    CHECK(purp_workspace_tiled_indices(&wm.monitors[0].workspace, wm.windows,
+        wm.window_count, 0, indices, PURP_ARRAY_LEN(indices)) == 2);
+    CHECK(purp_wm_stacking_order(&wm, indices, PURP_ARRAY_LEN(indices)) == 2);
+    CHECK(existing->geo.w < existing_frame.w && pending->geo.w > 0);
+
+    purp_wm_on_window_unmapped(&wm, (size_t)purp_wm_window_index(&wm, pending));
+    purp_wm_relayout(&wm);
+    CHECK(!pending->mapped && purp_wm_focused_window(&wm) == existing);
+    CHECK(purp_rect_eq(existing->geo, existing_frame));
+    CHECK(purp_workspace_tiled_indices(&wm.monitors[0].workspace, wm.windows,
+        wm.window_count, 0, indices, PURP_ARRAY_LEN(indices)) == 1);
+    CHECK(wm.windows[indices[0]] == existing);
+    CHECK(purp_wm_stacking_order(&wm, indices, PURP_ARRAY_LEN(indices)) == 1);
+    CHECK(wm.windows[indices[0]] == existing);
+    purp_wm_on_window_mapped(&wm, (size_t)purp_wm_window_index(&wm, pending));
+    purp_wm_relayout(&wm);
+    CHECK(pending->mapped && purp_wm_focused_window(&wm) == pending);
+    CHECK(purp_workspace_tiled_indices(&wm.monitors[0].workspace, wm.windows,
+        wm.window_count, 0, indices, PURP_ARRAY_LEN(indices)) == 2);
+    purp_wm_finish(&wm);
+}
+
+static void test_maximize_geometry_configure_and_restore(void) {
+    purp_wm_t wm;
+    test_window_wm_init(&wm);
+    purp_window_t *window = purp_wm_window_create(&wm, NULL);
+    CHECK(window != NULL);
+    if (!window) { purp_wm_finish(&wm); return; }
+    purp_wm_relayout(&wm);
+    purp_rect_t tiled_frame = window->geo;
+    purp_rect_t usable = purp_workspace_usable_area_in(&wm.monitors[0].workspace,
+        purp_wm_monitor_rect(&wm, 0));
+    CHECK(usable.y > wm.monitors[0].loc.y);
+    purp_wm_set_window_maximized(&wm, 0, true);
+    CHECK(window->is_maximized && window->want.maximized && !window->want.tiled);
+    CHECK(!window->is_fullscreen && purp_rect_eq(window->geo, usable));
+    purp_size_t inner = purp_window_surface_size(window);
+    CHECK(window->want.width == inner.w && window->want.height == inner.h);
+    size_t indices[1];
+    CHECK(purp_workspace_tiled_indices(&wm.monitors[0].workspace, wm.windows,
+        wm.window_count, 0, indices, PURP_ARRAY_LEN(indices)) == 0);
+    CHECK(purp_wm_bar_visible_on(&wm, 0));
+    purp_wm_set_window_maximized(&wm, 0, false);
+    CHECK(!window->is_maximized && !window->want.maximized && window->want.tiled);
+    CHECK(purp_rect_eq(window->geo, tiled_frame));
+
+    purp_wm_toggle_floating_focused(&wm);
+    purp_rect_t floating_frame = purp_rect_make(120, 150, 420, 280);
+    window->float_geo = window->geo = floating_frame;
+    purp_wm_relayout(&wm);
+    purp_wm_set_window_maximized(&wm, 0, true);
+    CHECK(purp_rect_eq(window->geo, usable) && window->want.maximized);
+    purp_wm_set_window_fullscreen(&wm, 0, true, -1);
+    CHECK(window->is_fullscreen && window->is_maximized && window->want.fullscreen);
+    CHECK(purp_rect_eq(window->geo, purp_wm_monitor_rect(&wm, 0)));
+    purp_wm_set_window_fullscreen(&wm, 0, false, -1);
+    CHECK(!window->is_fullscreen && window->is_maximized && window->want.maximized);
+    CHECK(purp_rect_eq(window->geo, usable));
+    purp_wm_set_window_maximized(&wm, 0, false);
+    CHECK(window->is_floating && !window->is_maximized && !window->want.maximized);
+    CHECK(purp_rect_eq(window->geo, floating_frame));
+    CHECK(purp_rect_eq(window->float_geo, floating_frame));
+    purp_wm_set_window_fullscreen(&wm, 0, true, -1);
+    purp_wm_set_window_maximized(&wm, 0, true);
+    CHECK(!window->is_fullscreen && !window->want.fullscreen && window->want.maximized);
+    CHECK(purp_rect_eq(window->geo, usable));
+    purp_wm_set_window_maximized(&wm, 0, false);
+    CHECK(purp_rect_eq(window->geo, floating_frame));
+    purp_wm_finish(&wm);
+}
+
+static void test_focusing_or_mapping_tiles_reconciles_covering_windows(void) {
+    for (int maximize = 0; maximize < 2; ++maximize) {
+        for (int map = 0; map < 2; ++map) {
+            purp_wm_t wm;
+            test_window_wm_init(&wm);
+            purp_window_t *background = purp_wm_window_create(&wm, NULL);
+            purp_window_t *foreground = map ? NULL : purp_wm_window_create(&wm, NULL);
+            CHECK(background != NULL && (map || foreground != NULL));
+            if (!background || (!map && !foreground)) { purp_wm_finish(&wm); continue; }
+            purp_wm_focus_window(&wm, purp_wm_window_index(&wm, background));
+            if (maximize)
+                purp_wm_set_window_maximized(&wm,
+                    (size_t)purp_wm_window_index(&wm, background), true);
+            else
+                purp_wm_set_window_fullscreen(&wm,
+                    (size_t)purp_wm_window_index(&wm, background), true, -1);
+            CHECK(maximize ? background->is_maximized : background->is_fullscreen);
+            if (map) {
+                foreground = purp_wm_window_create(&wm, test_server_toplevel());
+                CHECK(foreground != NULL);
+                if (!foreground) { purp_wm_finish(&wm); continue; }
+                CHECK(purp_wm_focused_window(&wm) == background);
+                CHECK(maximize ? background->is_maximized : background->is_fullscreen);
+                purp_wm_on_window_mapped(&wm,
+                    (size_t)purp_wm_window_index(&wm, foreground));
+            } else {
+                purp_wm_focus_window(&wm, purp_wm_window_index(&wm, foreground));
+            }
+            purp_wm_relayout(&wm);
+            CHECK(purp_wm_focused_window(&wm) == foreground);
+            CHECK(!background->is_fullscreen && !background->is_maximized);
+            CHECK(!background->want.fullscreen && !background->want.maximized);
+            CHECK(background->want.tiled && foreground->want.tiled);
+            CHECK(!purp_rect_overlaps(background->geo, foreground->geo));
+            size_t indices[2];
+            CHECK(purp_workspace_tiled_indices(&wm.monitors[0].workspace, wm.windows,
+                wm.window_count, 0, indices, PURP_ARRAY_LEN(indices)) == 2);
+            CHECK(purp_wm_bar_visible_on(&wm, 0));
+            purp_wm_finish(&wm);
+        }
+    }
+}
+
+static void test_transients_follow_and_stack_above_fullscreen_parent(void) {
+    purp_wm_t wm;
+    test_window_wm_init(&wm);
+    purp_monitor_desc_t desc = test_monitor_desc("WM-2", 1200, 900, 60000, 1, 1000, 0);
+    CHECK(purp_wm_add_monitor(&wm, &desc) == 1);
+    wm.monitors[1].workspace.gaps_enabled = false;
+    purp_wm_view_tags_on(&wm, 1, 1u << 3);
+    purp_window_t *parent = purp_wm_window_create(&wm, NULL);
+    CHECK(parent != NULL);
+    if (!parent) { purp_wm_finish(&wm); return; }
+    purp_wm_set_window_fullscreen(&wm, (size_t)purp_wm_window_index(&wm, parent), true, -1);
+    purp_wm_view_tags_on(&wm, 0, 1);
+    purp_window_t *child = purp_wm_window_create(&wm, test_server_toplevel());
+    CHECK(child != NULL);
+    if (!child) { purp_wm_finish(&wm); return; }
+    CHECK(child->monitor == 0 && child->tags == 1);
+    purp_wm_set_window_parent(&wm, (size_t)purp_wm_window_index(&wm, child), parent->id);
+    purp_wm_on_window_mapped(&wm, (size_t)purp_wm_window_index(&wm, child));
+    purp_wm_relayout(&wm);
+    CHECK(child->parent_id == parent->id && child->is_floating);
+    CHECK(child->monitor == parent->monitor && child->tags == parent->tags);
+    CHECK(purp_wm_focused_window(&wm) == child && parent->is_fullscreen);
+    CHECK(!child->want.tiled && parent->want.fullscreen);
+    purp_rect_t output = purp_wm_monitor_rect(&wm, (size_t)parent->monitor);
+    CHECK(child->geo.x >= output.x && child->geo.x + child->geo.w <= output.x + output.w);
+    CHECK(child->geo.y >= output.y && child->geo.y + child->geo.h <= output.y + output.h);
+    CHECK(abs((2 * child->geo.x + child->geo.w) - (2 * output.x + output.w)) <= 1);
+    CHECK(abs((2 * child->geo.y + child->geo.h) - (2 * output.y + output.h)) <= 1);
+    size_t order[2] = {0};
+    CHECK(purp_wm_stacking_order(&wm, order, PURP_ARRAY_LEN(order)) == 2);
+    CHECK(wm.windows[order[0]] == child && wm.windows[order[1]] == parent);
+    purp_wm_focus_window(&wm, purp_wm_window_index(&wm, parent));
+    CHECK(parent->is_fullscreen);
+    CHECK(purp_wm_stacking_order(&wm, order, PURP_ARRAY_LEN(order)) == 2);
+    CHECK(wm.windows[order[0]] == child && wm.windows[order[1]] == parent);
+    purp_wm_on_window_unmapped(&wm, (size_t)purp_wm_window_index(&wm, child));
+    purp_wm_relayout(&wm);
+    CHECK(purp_wm_focused_window(&wm) == parent && parent->is_fullscreen);
+    CHECK(purp_wm_stacking_order(&wm, order, PURP_ARRAY_LEN(order)) == 1);
+    CHECK(wm.windows[order[0]] == parent);
+    purp_wm_finish(&wm);
+}
+
+static void test_rule_sized_float_retiles_with_nonzero_configure(void) {
+    purp_wm_t wm;
+    test_window_wm_init(&wm);
+    purp_window_t *window = purp_wm_window_create(&wm, NULL);
+    CHECK(window != NULL);
+    if (!window) { purp_wm_finish(&wm); return; }
+    purp_window_set_app_id(window, "spotlight");
+    purp_window_set_title(window, "Rule-sized dialog");
+    CHECK(purp_wm_apply_window_rules(&wm, (size_t)purp_wm_window_index(&wm, window)));
+    purp_wm_relayout(&wm);
+    CHECK(window->is_floating && window->size_from_client);
+    CHECK(window->want.width == 0 && window->want.height == 0 && !window->want.tiled);
+    purp_wm_toggle_floating_focused(&wm);
+    CHECK(!window->is_floating && window->want.tiled);
+    purp_size_t inner = purp_window_surface_size(window);
+    CHECK(window->want.width > 0 && window->want.height > 0);
+    CHECK(window->want.width == inner.w && window->want.height == inner.h);
+    purp_wm_finish(&wm);
+}
+
+static void test_floating_layout_focus_raises_and_fullscreen_restores(void) {
+    purp_wm_t wm;
+    test_window_wm_init(&wm);
+    purp_window_t *older_float = purp_wm_window_create(&wm, NULL);
+    CHECK(older_float != NULL);
+    if (!older_float) { purp_wm_finish(&wm); return; }
+    purp_wm_toggle_floating_focused(&wm);
+    purp_window_t *ordinary = purp_wm_window_create(&wm, NULL);
+    CHECK(ordinary != NULL);
+    if (!ordinary) { purp_wm_finish(&wm); return; }
+    purp_wm_set_layout(&wm, PURP_LAYOUT_FLOATING);
+    CHECK_STREQ(purp_layout_symbol(purp_workspace_layout(&wm.monitors[0].workspace)), "><>");
+    purp_rect_t saved = purp_rect_make(130, 170, 460, 310);
+    ordinary->geo = saved;
+    ordinary->float_geo = purp_rect_make(40, 60, 300, 200);
+    purp_wm_relayout(&wm);
+    CHECK(!ordinary->is_floating && purp_rect_eq(ordinary->geo, saved));
+    purp_wm_focus_window(&wm, purp_wm_window_index(&wm, older_float));
+    size_t order[2];
+    CHECK(purp_wm_stacking_order(&wm, order, PURP_ARRAY_LEN(order)) == 2);
+    CHECK(wm.windows[order[0]] == older_float);
+    purp_wm_focus_window(&wm, purp_wm_window_index(&wm, ordinary));
+    CHECK(purp_wm_stacking_order(&wm, order, PURP_ARRAY_LEN(order)) == 2);
+    CHECK(wm.windows[order[0]] == ordinary && wm.windows[order[1]] == older_float);
+    purp_wm_toggle_fullscreen_focused(&wm);
+    CHECK(ordinary->is_fullscreen && purp_rect_eq(ordinary->geo, purp_wm_monitor_rect(&wm, 0)));
+    purp_wm_toggle_fullscreen_focused(&wm);
+    CHECK(!ordinary->is_fullscreen && !ordinary->is_floating);
+    CHECK(purp_rect_eq(ordinary->geo, saved));
+    CHECK(!ordinary->want.fullscreen && !ordinary->want.tiled);
+    purp_wm_finish(&wm);
+}
+
+static void test_spatial_arrows_swap_neighbours_without_wrapping(void) {
+    purp_wm_t wm;
+    test_window_wm_init(&wm);
+    for (int i = 0; i < 3; ++i) CHECK(purp_wm_window_create(&wm, NULL) != NULL);
+    if (wm.window_count != 3) { purp_wm_finish(&wm); return; }
+    purp_wm_relayout(&wm);
+    purp_window_t *master = wm.windows[0], *upper = wm.windows[1], *lower = wm.windows[2];
+    purp_rect_t master_frame = master->geo, upper_frame = upper->geo, lower_frame = lower->geo;
+    CHECK(master_frame.x < lower_frame.x && upper_frame.y < lower_frame.y);
+    purp_wm_focus_window(&wm, purp_wm_window_index(&wm, lower));
+    purp_wm_move_focused_window(&wm, -1, 0);
+    CHECK(purp_wm_focused_window(&wm) == lower);
+    CHECK(purp_rect_eq(lower->geo, master_frame));
+    CHECK(purp_rect_eq(master->geo, lower_frame));
+    CHECK(purp_rect_eq(upper->geo, upper_frame));
+    purp_wm_focus_window(&wm, purp_wm_window_index(&wm, upper));
+    purp_wm_move_focused_window(&wm, 0, 1);
+    CHECK(purp_wm_focused_window(&wm) == upper);
+    CHECK(purp_rect_eq(upper->geo, lower_frame));
+    CHECK(purp_rect_eq(master->geo, upper_frame));
+    purp_wm_move_focused_window(&wm, 0, 1);
+    CHECK(purp_wm_focused_window(&wm) == upper);
+    CHECK(purp_rect_eq(upper->geo, lower_frame));
+    CHECK(purp_rect_eq(master->geo, upper_frame));
+    CHECK(purp_rect_eq(lower->geo, master_frame));
+    purp_wm_finish(&wm);
+}
+
 /* =========================================================================================== */
 /* JSON, IPC and monitors.json                                                                  */
 /* =========================================================================================== */
@@ -1651,6 +1937,18 @@ static const purp_test_case_t TESTS[] = {
     { "adjacent_monitors_and_straddling_floats", test_adjacent_monitors_and_straddling_floats },
     { "pointer_clamping_crosses_seams_without_snag",
       test_pointer_clamping_crosses_seams_without_snag },
+    { "unmapped_toplevels_enter_and_leave_the_wm", test_unmapped_toplevels_enter_and_leave_the_wm },
+    { "maximize_geometry_configure_and_restore", test_maximize_geometry_configure_and_restore },
+    { "focusing_or_mapping_tiles_reconciles_covering_windows",
+      test_focusing_or_mapping_tiles_reconciles_covering_windows },
+    { "transients_follow_and_stack_above_fullscreen_parent",
+      test_transients_follow_and_stack_above_fullscreen_parent },
+    { "rule_sized_float_retiles_with_nonzero_configure",
+      test_rule_sized_float_retiles_with_nonzero_configure },
+    { "floating_layout_focus_raises_and_fullscreen_restores",
+      test_floating_layout_focus_raises_and_fullscreen_restores },
+    { "spatial_arrows_swap_neighbours_without_wrapping",
+      test_spatial_arrows_swap_neighbours_without_wrapping },
     { "json_parse_and_serialize", test_json_parse_and_serialize },
     { "ipc_command_parsing", test_ipc_command_parsing },
     { "monitors_json_round_trip", test_monitors_json_round_trip },

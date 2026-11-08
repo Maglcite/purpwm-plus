@@ -43,6 +43,8 @@ typedef struct purp_window_configure {
     int32_t height;
     bool activated;       /* xdg_toplevel.state.activated */
     bool fullscreen;      /* .fullscreen */
+    bool maximized;       /* .maximized */
+    bool resizing;        /* .resizing */
     bool tiled;           /* all four .tiled_left/right/top/bottom states */
 } purp_window_configure_t;
 
@@ -50,11 +52,14 @@ typedef struct purp_window_configure {
 typedef struct purp_window {
     uint64_t id;                     /* stable, unique, never 0 */
     purp_toplevel_t *toplevel;       /* server xdg_toplevel; NULL in unit tests */
+    uint64_t parent_id;              /* 0 = none; stable transient parent ID; reparent on unmap/destroy */
 
     int monitor;                     /* index of the owning monitor */
     uint16_t tags;                   /* 9-bit tag mask */
     bool is_floating;
     bool is_fullscreen;
+    bool is_maximized;               /* fills usable monitor area below bar; excluded from tiling */
+    bool is_resizing;                /* interactive resize grab: advertise .resizing */
     bool is_urgent;                  /* set by untrusted xdg_activation requests */
     bool is_scratchpad;              /* the Mod+s drop-down terminal */
     bool is_hidden;                  /* scratchpad currently hidden */
@@ -66,6 +71,8 @@ typedef struct purp_window {
 
     purp_rect_t geo;                 /* outer frame incl. borders, global logical coords */
     purp_rect_t float_geo;           /* saved floating frame */
+    bool has_saved_geo;
+    purp_rect_t saved_geo;           /* pre-fullscreen/maximize frame for Floating layout and floats */
     bool size_from_client;           /* self-sized float: configured 0x0, frame follows client */
     bool client_sized_once;          /* client size adopted at least once (first time centres) */
     float cfact;                     /* height weight inside its tiled column (dwm cfacts) */
@@ -97,7 +104,9 @@ bool purp_window_set_app_id(purp_window_t *win, const char *app_id);
 bool purp_window_set_title(purp_window_t *win, const char *title);
 /* Title for the bar: title, else app_id, else "purpwm+ client". */
 const char *purp_window_display_title(const purp_window_t *win);
-/* Visible on `selected_tags`: never when hidden; scratchpads always; else tags overlap. */
+/* Visible on `selected_tags`: never when hidden; scratchpads always; else tags overlap.
+ * Server toplevels (win->toplevel != NULL) MUST also be mapped; unit-test windows with
+ * win->toplevel == NULL remain visible without a server surface. */
 bool purp_window_is_visible_on(const purp_window_t *win, uint16_t selected_tags);
 /* Where the client's visible content starts (inside the border; geo.loc when fullscreen). */
 purp_point_t purp_window_content_loc(const purp_window_t *win);
@@ -111,7 +120,7 @@ bool purp_window_client_geometry_size(const purp_window_t *win, purp_size_t *out
 purp_size_t purp_window_clamp_frame_to_client_limits(const purp_window_t *win, purp_size_t frame);
 /* Compute `want` from geometry and focus and set configure_dirty when it changed. Tiled states
  * are set only for non-floating, non-fullscreen, non-scratchpad windows in a tiling layout;
- * self-sized floats (size_from_client, not fullscreen) get 0x0. Maximized is never advertised. */
+ * self-sized floats (size_from_client, not fullscreen) get 0x0. */
 void purp_window_configure(purp_window_t *win, bool focused, bool tiled_layout);
 
 /* =========================================================================================== */
@@ -491,6 +500,11 @@ double purp_wm_adjust_scale(purp_wm_t *wm, double delta);
 purp_window_t *purp_wm_window_create(purp_wm_t *wm, purp_toplevel_t *toplevel);
 /* Remove and free a window; focus moves to a visible window on the same monitor. */
 void purp_wm_window_destroy(purp_wm_t *wm, purp_window_t *win);
+/* Admit/focus on first map, or remove from visible focus/parent relationships on unmap. */
+void purp_wm_on_window_mapped(purp_wm_t *wm, size_t idx);
+void purp_wm_on_window_unmapped(purp_wm_t *wm, size_t idx);
+/* Set the stable transient parent ID (0 clears the relationship). */
+void purp_wm_set_window_parent(purp_wm_t *wm, size_t idx, uint64_t parent_id);
 int purp_wm_window_index(const purp_wm_t *wm, const purp_window_t *win);
 int purp_wm_window_index_by_id(const purp_wm_t *wm, uint64_t id);
 purp_window_t *purp_wm_window_by_id(const purp_wm_t *wm, uint64_t id);
@@ -591,6 +605,8 @@ void purp_wm_toggle_fullscreen_focused(purp_wm_t *wm);
 /* Client-driven fullscreen (xdg_toplevel.set_fullscreen/unset_fullscreen); `monitor` >= 0 moves
  * the window to that monitor first. */
 void purp_wm_set_window_fullscreen(purp_wm_t *wm, size_t idx, bool fullscreen, int monitor);
+/* Client-driven maximize/unmaximize within the usable monitor area below the bar. */
+void purp_wm_set_window_maximized(purp_wm_t *wm, size_t idx, bool maximized);
 /* Mod+o: toggle a 1.0 opacity override. */
 void purp_wm_toggle_opacity_focused(purp_wm_t *wm);
 /* Mod+s: show (on the active monitor, re-centred), hide, or ask for a spawn. */

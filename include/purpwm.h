@@ -435,6 +435,9 @@ int purp_xdg_popup_monitor(const purp_popup_t *popup);
  * `monitor` (< 0: all). Returns the count written. */
 size_t purp_xdg_visible_popups(purp_server_t *server, int monitor, purp_popup_t **out,
                                size_t cap);
+/* Owner-scoped mapped popups for rendering and hit-testing. */
+size_t purp_xdg_popups_for_root(purp_server_t *server, purp_surface_t *root,
+                                purp_popup_t **out, size_t cap);
 /* Topmost visible popup accepting input at global `pt`. */
 purp_popup_t *purp_xdg_popup_at(purp_server_t *server, purp_pointf_t pt);
 /* Dismiss grabbed popups (popup_done, topmost first) — clicking outside or focus changes. */
@@ -519,6 +522,7 @@ typedef enum purp_cursor_mode {
 typedef struct purp_touch_point {
     bool active;
     int32_t slot;                           /* backend slot == wl_touch id */
+    uint32_t down_serial;
     purp_surface_t *surface;                /* focus (NULL when swallowed / no client) */
     purp_pointf_t pos;                      /* global logical */
     purp_pointf_t surface_origin;           /* global origin of `surface` */
@@ -549,6 +553,7 @@ typedef struct purp_drag {
     purp_data_source_t *source;             /* NULL: same-client drag without data */
     purp_surface_t *origin;
     purp_surface_t *icon;                   /* role DND_ICON */
+    purp_point_t drag_icon_offset;          /* DND_ICON committed surface offsets */
     purp_surface_t *focus;
     struct wl_resource *focus_device;       /* wl_data_device of the focus client */
     struct wl_resource *offer;
@@ -588,6 +593,8 @@ typedef struct purp_seat {
     uint32_t modifiers;                     /* PURP_MOD_* summary */
     uint32_t pressed_keys[PURP_MAX_PRESSED_KEYS];   /* forwarded keys still down */
     size_t pressed_key_count;
+    uint32_t last_keyboard_serial;
+    struct wl_client *last_keyboard_client;
     purp_surface_t *keyboard_focus;
     struct wl_listener keyboard_focus_destroy;
 
@@ -598,11 +605,13 @@ typedef struct purp_seat {
     uint32_t pressed_buttons[PURP_MAX_PRESSED_BUTTONS];
     size_t pressed_button_count;
     uint32_t last_button_serial;
+    struct wl_client *last_button_client;
     uint32_t last_enter_serial;
 
     /* Touch. */
     purp_touch_point_t touch[PURP_MAX_TOUCH_POINTS];
     uint32_t last_touch_serial;
+    struct wl_client *last_touch_client;
 
     /* Cursor image requested by the pointer-focus client. */
     purp_cursor_mode_t cursor_mode;
@@ -669,6 +678,9 @@ purp_touch_point_t *purp_seat_touch_point(purp_server_t *server, int32_t slot);
  * (validates move/resize/popup-grab/activation requests). */
 bool purp_seat_validate_grab_serial(purp_server_t *server, struct wl_client *client,
                                     uint32_t serial);
+/* Validate a recent pointer button, touch-down, or key-press serial for popup grabs and xdg-activation. */
+bool purp_seat_validate_input_serial(purp_server_t *server, struct wl_client *client,
+                                     uint32_t serial);
 
 /* Selections. `source` NULL clears. Clients bound to data devices / primary / data-control get
  * offers for the keyboard-focus client (and every data-control client). */
@@ -844,6 +856,10 @@ typedef struct purp_interactive_grab {
     purp_rect_t start_geo;
     uint32_t edges;                         /* purp_edges_t */
     purp_tiled_resize_t plan;               /* TILED_RESIZE: row keys are window ids */
+    uint16_t plan_tags;                     /* TILED_RESIZE: cancel after tag/layout switches */
+    purp_layout_t plan_layout;
+    bool pending_float;                    /* defer floating until drag reaches >= 10 logical px */
+    uint32_t button;                        /* initiating mouse button; 0 for touch grabs */
     bool forward_release;                   /* client-started grabs forward the button release */
     int32_t touch_slot;                     /* -1 for pointer grabs */
 } purp_interactive_grab_t;
@@ -940,6 +956,7 @@ struct purp_server {
     size_t swallowed_touch_count;
     int32_t touch_grab_slot;                /* slot driving `grab`, -1 none */
     double bar_scroll_accum;
+    uint64_t hovered_window_id;             /* 0 = none; stable sloppy-focus enter tracking */
     purp_interactive_grab_t grab;
     purp_key_resize_t key_resize;
     purp_layer_surface_t *layer_focus;      /* ON_DEMAND layer focused by click */
@@ -1033,7 +1050,7 @@ void purp_server_reap_children(purp_server_t *server);
 void purp_server_shutdown_session(purp_server_t *server);
 
 /* Session services started by autostart. */
-void purp_server_spawn_terminal(purp_server_t *server);
+bool purp_server_spawn_terminal(purp_server_t *server);
 void purp_server_spawn_spotlight_daemon(purp_server_t *server);   /* pkill, rm sock, --daemon */
 void purp_server_spawn_keyring(purp_server_t *server);
 void purp_server_spawn_screenshot_portal(purp_server_t *server);

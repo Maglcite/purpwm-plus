@@ -61,7 +61,8 @@ const char *purp_window_display_title(const purp_window_t *win) {
     return *nonempty(win->app_id) ? win->app_id : "purpwm+ client";
 }
 bool purp_window_is_visible_on(const purp_window_t *win, uint16_t selected_tags) {
-    return !win->is_hidden && (win->is_scratchpad || (win->tags & selected_tags) != 0);
+    return (win->toplevel == NULL || win->mapped) && !win->is_hidden &&
+           (win->is_scratchpad || (win->tags & selected_tags) != 0);
 }
 purp_point_t purp_window_content_loc(const purp_window_t *win) {
     int32_t border = win->is_fullscreen ? 0 : PURP_BORDER_WIDTH;
@@ -99,12 +100,16 @@ purp_size_t purp_window_clamp_frame_to_client_limits(const purp_window_t *win, p
 }
 void purp_window_configure(purp_window_t *win, bool focused, bool tiled_layout) {
     purp_size_t size = purp_window_surface_size(win);
-    if (win->size_from_client && !win->is_fullscreen) size = (purp_size_t){ 0, 0 };
+    if (win->size_from_client && (win->is_floating || win->is_scratchpad) &&
+        !win->is_fullscreen && !win->is_maximized) size = (purp_size_t){ 0, 0 };
     purp_window_configure_t next = { .width = size.w, .height = size.h,
         .activated = focused, .fullscreen = win->is_fullscreen,
-        .tiled = !win->is_floating && !win->is_fullscreen && !win->is_scratchpad && tiled_layout };
+        .maximized = win->is_maximized, .resizing = win->is_resizing,
+        .tiled = !win->is_floating && !win->is_fullscreen && !win->is_maximized &&
+                 !win->is_scratchpad && tiled_layout };
     if (next.width != win->want.width || next.height != win->want.height ||
         next.activated != win->want.activated || next.fullscreen != win->want.fullscreen ||
+        next.maximized != win->want.maximized || next.resizing != win->want.resizing ||
         next.tiled != win->want.tiled) {
         win->want = next;
         win->configure_dirty = true;
@@ -170,6 +175,11 @@ purp_rect_t purp_workspace_usable_area_in(const purp_workspace_t *ws, purp_rect_
     return purp_rect_make(output_rect.x + gap, output_rect.y + bar + gap,
         purp_max_i32(output_rect.w - 2 * gap, 1), purp_max_i32(output_rect.h - bar - 2 * gap, 1));
 }
+static purp_rect_t maximized_area_in(const purp_workspace_t *ws, purp_rect_t output_rect) {
+    int32_t bar = ws->show_bar ? PURP_BAR_HEIGHT : 0;
+    return purp_rect_make(output_rect.x, output_rect.y + bar, output_rect.w,
+                          purp_max_i32(output_rect.h - bar, 1));
+}
 bool purp_workspace_centered_sides(const purp_workspace_t *ws, size_t tiled_count) {
     size_t masters = (size_t)purp_max_i32(purp_workspace_nmaster(ws), 0);
     return purp_workspace_layout(ws) == PURP_LAYOUT_CENTERED_MASTER && masters > 0 &&
@@ -181,7 +191,8 @@ size_t purp_workspace_tiled_indices(const purp_workspace_t *ws, purp_window_t *c
     for (size_t i = 0; i < count && n < cap; ++i) {
         const purp_window_t *win = windows[i];
         if ((monitor < 0 || win->monitor == monitor) && purp_window_is_visible_on(win, ws->selected_tags) &&
-            !win->is_floating && !win->is_fullscreen && !win->is_scratchpad) out[n++] = i;
+            !win->is_floating && !win->is_fullscreen && !win->is_maximized &&
+            !win->is_scratchpad) out[n++] = i;
     }
     return n;
 }
@@ -343,7 +354,8 @@ void purp_workspace_arrange_in(const purp_workspace_t *ws, purp_window_t *const 
         for (size_t i = 0; i < count; ++i) {
             purp_window_t *win = windows[i];
             if ((monitor < 0 || win->monitor == monitor) &&
-                purp_window_is_visible_on(win, ws->selected_tags) && !win->is_fullscreen) {
+                purp_window_is_visible_on(win, ws->selected_tags) &&
+                !win->is_fullscreen && !win->is_maximized) {
                 win->geo = purp_floating_layout_geo(win->geo, win->float_geo,
                                                    win->is_floating, win->is_scratchpad);
                 win->float_geo = win->geo;
@@ -393,6 +405,7 @@ void purp_workspace_arrange_in(const purp_workspace_t *ws, purp_window_t *const 
             continue;
         }
         if (win->is_fullscreen) win->geo = output_rect;
+        else if (win->is_maximized) win->geo = maximized_area_in(ws, output_rect);
         else if (win->is_floating || win->is_scratchpad) win->geo = win->float_geo;
         purp_window_configure(win, focused_idx >= 0 && (size_t)focused_idx == i,
                               layout != PURP_LAYOUT_FLOATING);
@@ -873,6 +886,8 @@ static void translate_windows(purp_wm_t *wm, const purp_point_t *old_locs) {
         purp_point_t loc = wm->monitors[win->monitor].loc, old = old_locs[win->monitor];
         win->geo = purp_rect_translate(win->geo, loc.x - old.x, loc.y - old.y);
         win->float_geo = purp_rect_translate(win->float_geo, loc.x - old.x, loc.y - old.y);
+        if (win->has_saved_geo)
+            win->saved_geo = purp_rect_translate(win->saved_geo, loc.x - old.x, loc.y - old.y);
     }
 }
 static void ensure_primary(purp_wm_t *wm) {
@@ -905,6 +920,7 @@ void purp_wm_normalize_monitors(purp_wm_t *wm) {
         purp_window_t *win = wm->windows[i];
         win->geo = purp_rect_translate(win->geo, -min_x, -min_y);
         win->float_geo = purp_rect_translate(win->float_geo, -min_x, -min_y);
+        if (win->has_saved_geo) win->saved_geo = purp_rect_translate(win->saved_geo, -min_x, -min_y);
         if (wm->monitor_count && (win->monitor < 0 || (size_t)win->monitor >= wm->monitor_count ||
                                  !wm->monitors[win->monitor].enabled)) {
             win->monitor = (int)primary;
@@ -1010,6 +1026,7 @@ size_t purp_wm_retain_connected_monitors(purp_wm_t *wm, const char *const *live_
             int32_t dx = mon->loc.x - old_rects[old].x, dy = mon->loc.y - old_rects[old].y;
             win->float_geo = purp_rect_translate(win->float_geo, dx, dy);
             win->geo = purp_rect_translate(win->geo, dx, dy);
+            if (win->has_saved_geo) win->saved_geo = purp_rect_translate(win->saved_geo, dx, dy);
         }
         win->float_geo = purp_clamp_floating_geo_in(win->float_geo, purp_monitor_rect(mon), mon->workspace.show_bar);
         if (win->is_floating || win->is_scratchpad) win->geo = win->float_geo;
@@ -1033,17 +1050,44 @@ void purp_wm_set_monitor_physical(purp_wm_t *wm, size_t idx, purp_size_t physica
 void purp_wm_set_monitor_scale(purp_wm_t *wm, size_t idx, double scale) {
     if (idx >= wm->monitor_count) return;
     purp_point_t old_locs[PURP_MAX_MONITORS];
-    for (size_t i = 0; i < wm->monitor_count; ++i) old_locs[i] = wm->monitors[i].loc;
+    purp_rect_t old_rects[PURP_MAX_MONITORS];
+    bool shifted_x[PURP_MAX_MONITORS] = { false }, shifted_y[PURP_MAX_MONITORS] = { false };
+    for (size_t i = 0; i < wm->monitor_count; ++i) {
+        old_locs[i] = wm->monitors[i].loc;
+        old_rects[i] = purp_monitor_rect(&wm->monitors[i]);
+    }
     purp_monitor_t *mon = &wm->monitors[idx];
-    purp_rect_t old = purp_monitor_rect(mon);
     mon->scale = purp_clamp_f64(scale, PURP_SCALE_MIN, PURP_SCALE_MAX);
     mon->logical_size = purp_logical_output_size_for(mon->physical_size, mon->scale);
-    int32_t dw = mon->logical_size.w - old.w, dh = mon->logical_size.h - old.h;
-    for (size_t i = 0; i < wm->monitor_count; ++i) {
-        if (i == idx || !wm->monitors[i].enabled) continue;
-        if (llabs((long long)wm->monitors[i].loc.x - old.x - old.w) <= 2) wm->monitors[i].loc.x += dw;
-        if (llabs((long long)wm->monitors[i].loc.y - old.y - old.h) <= 2) wm->monitors[i].loc.y += dh;
-    }
+    int32_t dw = mon->logical_size.w - old_rects[idx].w;
+    int32_t dh = mon->logical_size.h - old_rects[idx].h;
+    shifted_x[idx] = shifted_y[idx] = true;
+    bool changed;
+    do {
+        changed = false;
+        for (size_t src = 0; src < wm->monitor_count; ++src) {
+            if (!wm->monitors[src].enabled) continue;
+            purp_rect_t from = old_rects[src];
+            for (size_t dst = 0; dst < wm->monitor_count; ++dst) {
+                if (dst == idx || !wm->monitors[dst].enabled) continue;
+                purp_rect_t to = old_rects[dst];
+                if (dw && shifted_x[src] && !shifted_x[dst] &&
+                    llabs((long long)to.x - from.x - from.w) <= 2 &&
+                    purp_min_i32(from.y + from.h, to.y + to.h) > purp_max_i32(from.y, to.y)) {
+                    shifted_x[dst] = true;
+                    wm->monitors[dst].loc.x += dw;
+                    changed = true;
+                }
+                if (dh && shifted_y[src] && !shifted_y[dst] &&
+                    llabs((long long)to.y - from.y - from.h) <= 2 &&
+                    purp_min_i32(from.x + from.w, to.x + to.w) > purp_max_i32(from.x, to.x)) {
+                    shifted_y[dst] = true;
+                    wm->monitors[dst].loc.y += dh;
+                    changed = true;
+                }
+            }
+        }
+    } while (changed);
     translate_windows(wm, old_locs);
     wm->monitors_dirty = true;
     purp_wm_clamp_floating_windows(wm);
@@ -1055,6 +1099,17 @@ double purp_wm_adjust_scale(purp_wm_t *wm, double delta) {
                                 PURP_SCALE_STEP, PURP_SCALE_MIN, PURP_SCALE_MAX);
     purp_wm_set_monitor_scale(wm, idx, next);
     return next;
+}
+
+static void admit_pending_scratchpad(purp_wm_t *wm, purp_window_t *win) {
+    if (!wm->pending_scratchpad_spawn) return;
+    size_t mon = win->monitor >= 0 ? (size_t)win->monitor : purp_wm_active_monitor_index(wm);
+    win->is_scratchpad = win->is_floating = true;
+    win->is_hidden = false;
+    win->float_geo = purp_scratchpad_geo_in(purp_wm_monitor_rect(wm, mon),
+                                           mon < wm->monitor_count && wm->monitors[mon].workspace.show_bar);
+    win->geo = win->float_geo;
+    wm->pending_scratchpad_spawn = false;
 }
 
 purp_window_t *purp_wm_window_create(purp_wm_t *wm, purp_toplevel_t *toplevel) {
@@ -1072,16 +1127,17 @@ purp_window_t *purp_wm_window_create(purp_wm_t *wm, purp_toplevel_t *toplevel) {
     purp_window_init(win, toplevel, tags, (int)mon, purp_wm_monitor_rect(wm, mon));
     win->id = wm->next_window_id++;
     if (wm->next_window_id == 0) wm->next_window_id = 1;
-    if (wm->pending_scratchpad_spawn) {
-        win->is_scratchpad = win->is_floating = true;
-        win->float_geo = purp_scratchpad_geo_in(purp_wm_monitor_rect(wm, mon),
-                                               wm->monitor_count && wm->monitors[mon].workspace.show_bar);
-        win->geo = win->float_geo;
-        wm->pending_scratchpad_spawn = false;
-    }
+    if (!toplevel) admit_pending_scratchpad(wm, win);
+    else if (wm->monitor_count)
+        win->geo = purp_workspace_usable_area_in(&wm->monitors[mon].workspace,
+                                                purp_wm_monitor_rect(wm, mon));
     memmove(wm->windows + 1, wm->windows, wm->window_count * sizeof(*wm->windows));
     wm->windows[0] = win; ++wm->window_count;
-    wm->focused_idx = 0;
+    if (toplevel) {
+        if (wm->focused_idx >= 0) ++wm->focused_idx;
+        purp_window_configure(win, false, wm->monitor_count &&
+            purp_workspace_layout(&wm->monitors[mon].workspace) != PURP_LAYOUT_FLOATING);
+    } else wm->focused_idx = 0;
     purp_wm_relayout(wm);
     return win;
 }
@@ -1100,9 +1156,129 @@ purp_window_t *purp_wm_window_by_id(const purp_wm_t *wm, uint64_t id) {
 purp_window_t *purp_wm_focused_window(const purp_wm_t *wm) {
     return wm->focused_idx >= 0 && (size_t)wm->focused_idx < wm->window_count ? wm->windows[wm->focused_idx] : NULL;
 }
+static purp_layout_t window_layout(const purp_wm_t *wm, const purp_window_t *win) {
+    return win->monitor >= 0 && (size_t)win->monitor < wm->monitor_count ?
+        purp_workspace_layout(&wm->monitors[win->monitor].workspace) : PURP_LAYOUT_TILE;
+}
+
+static bool window_is_ancestor(const purp_wm_t *wm, const purp_window_t *ancestor,
+                               const purp_window_t *win) {
+    uint64_t parent_id = win->parent_id;
+    for (size_t depth = 0; parent_id && depth < wm->window_count; ++depth) {
+        if (parent_id == ancestor->id) return true;
+        const purp_window_t *parent = purp_wm_window_by_id(wm, parent_id);
+        if (!parent) break;
+        parent_id = parent->parent_id;
+    }
+    return false;
+}
+
+static void restore_saved_geometry(purp_wm_t *wm, purp_window_t *win) {
+    if (!win->has_saved_geo) return;
+    win->float_geo = win->saved_geo;
+    if (win->is_floating || win->is_scratchpad || window_layout(wm, win) == PURP_LAYOUT_FLOATING)
+        win->geo = win->saved_geo;
+    win->has_saved_geo = false;
+}
+
+static void set_window_states(purp_wm_t *wm, purp_window_t *win, bool fullscreen, bool maximized) {
+    bool was_expanded = win->is_fullscreen || win->is_maximized;
+    if (!was_expanded && (fullscreen || maximized)) {
+        win->saved_geo = win->is_floating || win->is_scratchpad ? win->float_geo : win->geo;
+        win->has_saved_geo = true;
+    }
+    win->is_fullscreen = fullscreen;
+    win->is_maximized = maximized;
+    if (was_expanded && !fullscreen && !maximized) restore_saved_geometry(wm, win);
+    if (win->monitor >= 0 && (size_t)win->monitor < wm->monitor_count) {
+        const purp_monitor_t *mon = &wm->monitors[win->monitor];
+        if (fullscreen) win->geo = purp_monitor_rect(mon);
+        else if (maximized) win->geo = maximized_area_in(&mon->workspace, purp_monitor_rect(mon));
+    }
+    purp_window_configure(win, purp_wm_focused_window(wm) == win && purp_wm_is_window_visible(wm, win),
+                          window_layout(wm, win) != PURP_LAYOUT_FLOATING);
+}
+
+static void reconcile_window_focus(purp_wm_t *wm, purp_window_t *win) {
+    if (!purp_wm_is_window_visible(wm, win)) return;
+    bool tiled = !win->is_floating && !win->is_scratchpad && !win->is_fullscreen &&
+                 !win->is_maximized && window_layout(wm, win) != PURP_LAYOUT_FLOATING;
+    for (size_t i = 0; i < wm->window_count; ++i) {
+        purp_window_t *other = wm->windows[i];
+        if (other == win || other->monitor != win->monitor || !purp_wm_is_window_visible(wm, other) ||
+            window_is_ancestor(wm, other, win)) continue;
+        if (other->is_fullscreen || (tiled && other->is_maximized))
+            set_window_states(wm, other, false, tiled ? false : other->is_maximized);
+    }
+}
+
+static purp_rect_t center_over_parent(const purp_wm_t *wm, const purp_window_t *parent,
+                                      purp_rect_t geo) {
+    geo.x = parent->geo.x + (parent->geo.w - geo.w) / 2;
+    geo.y = parent->geo.y + (parent->geo.h - geo.h) / 2;
+    const purp_monitor_t *mon = &wm->monitors[parent->monitor];
+    return purp_clamp_floating_geo_in(geo, purp_monitor_rect(mon), mon->workspace.show_bar);
+}
+
+static void reparent_window_children(purp_wm_t *wm, const purp_window_t *win) {
+    for (size_t i = 0; i < wm->window_count; ++i)
+        if (wm->windows[i]->parent_id == win->id) wm->windows[i]->parent_id = win->parent_id;
+}
+
+void purp_wm_set_window_parent(purp_wm_t *wm, size_t idx, uint64_t parent_id) {
+    if (idx >= wm->window_count) return;
+    purp_window_t *win = wm->windows[idx];
+    purp_window_t *parent = parent_id ? purp_wm_window_by_id(wm, parent_id) : NULL;
+    if (parent_id == win->id || (parent && window_is_ancestor(wm, win, parent))) return;
+    win->parent_id = parent_id;
+    if (parent && purp_wm_is_window_visible(wm, parent)) {
+        win->monitor = parent->monitor;
+        win->tags = parent->tags;
+        win->is_floating = true;
+        win->size_from_client = true;
+        win->float_geo = center_over_parent(wm, parent, win->float_geo);
+        if (!win->is_fullscreen && !win->is_maximized) win->geo = win->float_geo;
+    }
+    purp_window_configure(win, purp_wm_focused_window(wm) == win && purp_wm_is_window_visible(wm, win),
+                          window_layout(wm, win) != PURP_LAYOUT_FLOATING);
+    purp_wm_relayout(wm);
+}
+
+void purp_wm_on_window_mapped(purp_wm_t *wm, size_t idx) {
+    if (idx >= wm->window_count) return;
+    purp_window_t *win = wm->windows[idx];
+    win->mapped = true;
+    admit_pending_scratchpad(wm, win);
+    (void)purp_wm_apply_window_rules(wm, idx);
+    if (win->parent_id) purp_wm_set_window_parent(wm, idx, win->parent_id);
+    if (purp_wm_is_window_visible(wm, win) && win->parent_id == 0 &&
+        !win->is_floating && !win->is_scratchpad) {
+        for (size_t i = 0; i < wm->window_count; ++i) {
+            purp_window_t *other = wm->windows[i];
+            if (other != win && other->monitor == win->monitor && purp_wm_is_window_visible(wm, other) &&
+                (other->is_fullscreen || other->is_maximized))
+                set_window_states(wm, other, false, false);
+        }
+    }
+    purp_wm_focus_window(wm, (int)idx);
+    purp_wm_relayout(wm);
+}
+
+void purp_wm_on_window_unmapped(purp_wm_t *wm, size_t idx) {
+    if (idx >= wm->window_count) return;
+    purp_window_t *win = wm->windows[idx];
+    win->mapped = false;
+    win->is_resizing = false;
+    win->rules_applied = false;
+    set_window_states(wm, win, false, false);
+    reparent_window_children(wm, win);
+    purp_wm_relayout(wm);
+}
+
 void purp_wm_window_destroy(purp_wm_t *wm, purp_window_t *win) {
     int idx = purp_wm_window_index(wm, win);
     if (idx < 0) return;
+    reparent_window_children(wm, win);
     if (wm->focused_idx == idx) { wm->focused_monitor = win->monitor; wm->focused_idx = -1; }
     else if (wm->focused_idx > idx) --wm->focused_idx;
     memmove(wm->windows + idx, wm->windows + idx + 1, (wm->window_count - (size_t)idx - 1) * sizeof(*wm->windows));
@@ -1135,6 +1311,8 @@ void purp_wm_focus_window(purp_wm_t *wm, int idx) {
                 purp_workspace_layout(&wm->monitors[wm->windows[i]->monitor].workspace) != PURP_LAYOUT_FLOATING);
         return;
     }
+    if (!purp_wm_is_window_visible(wm, wm->windows[idx])) return;
+    reconcile_window_focus(wm, wm->windows[idx]);
     wm->focused_idx = idx;
     wm->focused_monitor = wm->windows[idx]->monitor;
     wm->windows[idx]->is_urgent = false;
@@ -1174,7 +1352,12 @@ bool purp_wm_apply_window_rules(purp_wm_t *wm, size_t idx) {
     return changed;
 }
 void purp_wm_relayout(purp_wm_t *wm) {
-    for (size_t i = 0; i < wm->window_count; ++i) (void)purp_wm_apply_window_rules(wm, i);
+    for (size_t i = 0; i < wm->window_count; ++i) {
+        purp_window_t *win = wm->windows[i];
+        if (!win->toplevel || win->mapped) (void)purp_wm_apply_window_rules(wm, i);
+        if (win->toplevel && !win->mapped)
+            purp_window_configure(win, false, window_layout(wm, win) != PURP_LAYOUT_FLOATING);
+    }
     purp_wm_ensure_valid_focus(wm);
     purp_window_t *focused = purp_wm_focused_window(wm);
     if (focused) focused->is_urgent = false;
@@ -1192,26 +1375,57 @@ void purp_wm_relayout(purp_wm_t *wm) {
 static int stacking_rank(const purp_wm_t *wm, size_t i) {
     const purp_window_t *win = wm->windows[i];
     bool focused = wm->focused_idx >= 0 && (size_t)wm->focused_idx == i;
-    if (focused && (win->is_fullscreen || win->is_floating || win->is_scratchpad)) return 0;
-    if (win->is_fullscreen) return 1;
-    if (win->is_floating || win->is_scratchpad) return 2;
-    return focused ? 3 : 4;
+    int tier = win->is_fullscreen ? 0 : win->is_maximized ? 1 :
+               win->is_floating || win->is_scratchpad ||
+               window_layout(wm, win) == PURP_LAYOUT_FLOATING ? 2 : 3;
+    return tier * 2 + (focused ? 0 : 1);
 }
 size_t purp_wm_stacking_order(const purp_wm_t *wm, size_t *out, size_t cap) {
+    if (!cap || !wm->window_count) return 0;
+    size_t order[wm->window_count], children[wm->window_count], parents[wm->window_count];
+    int ranks[wm->window_count];
+    size_t visible_count = 0;
+    for (size_t i = 0; i < wm->window_count; ++i) {
+        bool visible = purp_wm_is_window_visible(wm, wm->windows[i]);
+        ranks[i] = visible ? stacking_rank(wm, i) : -1;
+        children[i] = visible ? 0 : SIZE_MAX;
+        parents[i] = SIZE_MAX;
+    }
+    for (int rank = 0; rank < 8; ++rank)
+        for (size_t i = 0; i < wm->window_count; ++i)
+            if (ranks[i] == rank) order[visible_count++] = i;
+    for (size_t i = 0; i < visible_count; ++i) {
+        size_t child = order[i];
+        uint64_t parent_id = wm->windows[child]->parent_id;
+        for (size_t depth = 0; parent_id && depth < wm->window_count; ++depth) {
+            int parent = purp_wm_window_index_by_id(wm, parent_id);
+            if (parent < 0 || (size_t)parent == child) break;
+            if (children[parent] != SIZE_MAX) {
+                parents[child] = (size_t)parent;
+                ++children[parent];
+                break;
+            }
+            parent_id = wm->windows[parent]->parent_id;
+        }
+    }
     size_t n = 0;
-    for (int rank = 0; rank <= 4 && n < cap; ++rank)
-        for (size_t i = 0; i < wm->window_count && n < cap; ++i)
-            if (stacking_rank(wm, i) == rank && purp_wm_is_window_visible(wm, wm->windows[i])) out[n++] = i;
+    while (n < visible_count && n < cap) {
+        size_t next = SIZE_MAX;
+        for (size_t i = 0; i < visible_count; ++i)
+            if (children[order[i]] == 0) { next = order[i]; break; }
+        if (next == SIZE_MAX) break; /* Parent cycles are rejected by set_window_parent(). */
+        out[n++] = next;
+        children[next] = SIZE_MAX;
+        if (parents[next] != SIZE_MAX) --children[parents[next]];
+    }
     return n;
 }
 int purp_wm_window_at(const purp_wm_t *wm, purp_pointf_t pt) {
-    int best = -1, rank = 5;
-    for (size_t i = 0; i < wm->window_count; ++i) {
-        int candidate_rank = stacking_rank(wm, i);
-        if (candidate_rank < rank && purp_wm_is_window_visible(wm, wm->windows[i]) &&
-            purp_rect_contains_f(wm->windows[i]->geo, pt)) { best = (int)i; rank = candidate_rank; }
-    }
-    return best;
+    size_t order[wm->window_count ? wm->window_count : 1];
+    size_t n = purp_wm_stacking_order(wm, order, wm->window_count);
+    for (size_t i = 0; i < n; ++i)
+        if (purp_rect_contains_f(wm->windows[order[i]]->geo, pt)) return (int)order[i];
+    return -1;
 }
 static size_t wrap_position(size_t position, int delta, size_t count) {
     int64_t value = ((int64_t)position + delta) % (int64_t)count;
@@ -1225,9 +1439,9 @@ void purp_wm_cycle_focus(purp_wm_t *wm, int delta) {
         if (wm->focused_idx >= 0 && i == (size_t)wm->focused_idx) position = n;
         indices[n++] = i;
     }
-    wm->focused_idx = n ? (int)indices[position == SIZE_MAX ? (delta < 0 ? n - 1 : 0) :
-                                      wrap_position(position, delta, n)] : -1;
-    purp_wm_relayout(wm);
+    int target = n ? (int)indices[position == SIZE_MAX ? (delta < 0 ? n - 1 : 0) :
+                                  wrap_position(position, delta, n)] : -1;
+    purp_wm_focus_window(wm, target);
 }
 bool purp_wm_focus_monitor_at_point(purp_wm_t *wm, purp_pointf_t pt) {
     int mon = purp_wm_monitor_at(wm, pt);
@@ -1262,13 +1476,22 @@ void purp_wm_send_window_to_monitor(purp_wm_t *wm, size_t win_idx, size_t target
     mapped.x = rect.x + purp_round_i32((double)(mapped.x - old.x) / purp_max_i32(old.w, 1) * rect.w);
     mapped.y = rect.y + purp_round_i32((double)(mapped.y - old.y) / purp_max_i32(old.h, 1) * rect.h);
     win->float_geo = purp_clamp_floating_geo_in(mapped, rect, wm->monitors[target].workspace.show_bar);
-    if (win->is_floating || win->is_scratchpad) win->geo = win->float_geo;
+    if (win->has_saved_geo) {
+        purp_rect_t saved = win->saved_geo;
+        saved.x = rect.x + purp_round_i32((double)(saved.x - old.x) / purp_max_i32(old.w, 1) * rect.w);
+        saved.y = rect.y + purp_round_i32((double)(saved.y - old.y) / purp_max_i32(old.h, 1) * rect.h);
+        win->saved_geo = purp_clamp_floating_geo_in(saved, rect, wm->monitors[target].workspace.show_bar);
+    }
+    if (win->is_floating || win->is_scratchpad ||
+        purp_workspace_layout(&wm->monitors[target].workspace) == PURP_LAYOUT_FLOATING)
+        win->geo = win->float_geo;
     win->monitor = (int)target;
     if (!win->is_scratchpad) win->tags = wm->monitors[target].workspace.selected_tags;
     if (follow) {
         wm->focused_monitor = (int)target;
         wm->focused_idx = (int)win_idx;
         wm->pointer_location = purp_rect_center(rect);
+        reconcile_window_focus(wm, win);
     }
     purp_wm_relayout(wm);
 }
@@ -1277,7 +1500,11 @@ bool purp_wm_floating_grab_geometry(purp_wm_t *wm, size_t idx, purp_rect_t *out)
     purp_window_t *win = wm->windows[idx];
     bool floating_layout = win->monitor >= 0 && (size_t)win->monitor < wm->monitor_count &&
                            purp_workspace_layout(&wm->monitors[win->monitor].workspace) == PURP_LAYOUT_FLOATING;
-    if (!floating_layout && !win->is_floating && !win->is_scratchpad) {
+    if (win->is_maximized) {
+        win->is_maximized = false;
+        restore_saved_geometry(wm, win);
+        win->is_floating = true;
+    } else if (!floating_layout && !win->is_floating && !win->is_scratchpad) {
         win->is_floating = true; win->float_geo = win->geo;
     }
     if (out) *out = win->float_geo;
@@ -1306,16 +1533,33 @@ void purp_wm_move_focused_window(purp_wm_t *wm, int dx, int dy) {
     size_t position = n;
     for (size_t i = 0; i < n; ++i) if (indices[i] == (size_t)wm->focused_idx) { position = i; break; }
     if (position == n) return;
-    int adjacent = purp_wm_adjacent_monitor(wm, mon, dx, dy);
-    if (adjacent >= 0 && (n < 2 || ((dx < 0 || dy < 0) && position == 0) ||
-                        ((dx > 0 || dy > 0) && position + 1 == n))) {
-        purp_wm_send_window_to_monitor(wm, (size_t)wm->focused_idx, (size_t)adjacent, true);
-    } else if (n >= 2) {
-        size_t target = indices[wrap_position(position, dx < 0 || dy < 0 ? -1 : 1, n)];
-        wm->windows[wm->focused_idx] = wm->windows[target];
-        wm->windows[target] = win; wm->focused_idx = (int)target;
-        purp_wm_relayout(wm);
+    size_t target = SIZE_MAX;
+    double best_distance = INFINITY;
+    purp_pointf_t center = purp_rect_center(win->geo);
+    for (size_t i = 0; i < n; ++i) {
+        if (i == position) continue;
+        purp_rect_t other = wm->windows[indices[i]]->geo;
+        purp_pointf_t other_center = purp_rect_center(other);
+        int32_t overlap = dx ?
+            purp_min_i32(win->geo.y + win->geo.h, other.y + other.h) - purp_max_i32(win->geo.y, other.y) :
+            purp_min_i32(win->geo.x + win->geo.w, other.x + other.w) - purp_max_i32(win->geo.x, other.x);
+        double along = dx ? (other_center.x - center.x) * dx : (other_center.y - center.y) * dy;
+        if (overlap <= 0 || along <= 0) continue;
+        double x = other_center.x - center.x, y = other_center.y - center.y;
+        double distance = x * x + y * y;
+        if (distance < best_distance) { target = indices[i]; best_distance = distance; }
     }
+    if (target == SIZE_MAX) {
+        int adjacent = purp_wm_adjacent_monitor(wm, mon, dx, dy);
+        if (adjacent >= 0) {
+            purp_wm_send_window_to_monitor(wm, (size_t)wm->focused_idx, (size_t)adjacent, true);
+            return;
+        }
+        return;
+    }
+    wm->windows[wm->focused_idx] = wm->windows[target];
+    wm->windows[target] = win; wm->focused_idx = (int)target;
+    purp_wm_relayout(wm);
 }
 bool purp_wm_tiled_resize_plan(const purp_wm_t *wm, size_t idx, uint32_t edges, purp_tiled_resize_t *out) {
     *out = (purp_tiled_resize_t){ .monitor = -1 };
@@ -1519,7 +1763,8 @@ purp_point_t purp_wm_cascade_loc_on(const purp_wm_t *wm, size_t mon, purp_size_t
 void purp_wm_clamp_floating_windows(purp_wm_t *wm) {
     for (size_t i = 0; i < wm->window_count; ++i) {
         purp_window_t *win = wm->windows[i];
-        if (win->monitor < 0 || (size_t)win->monitor >= wm->monitor_count || win->is_fullscreen) continue;
+        if (win->monitor < 0 || (size_t)win->monitor >= wm->monitor_count ||
+            win->is_fullscreen || win->is_maximized) continue;
         const purp_monitor_t *mon = &wm->monitors[win->monitor];
         if (!win->is_floating && !win->is_scratchpad && purp_workspace_layout(&mon->workspace) != PURP_LAYOUT_FLOATING) continue;
         win->float_geo = purp_clamp_floating_geo_in(win->float_geo, purp_monitor_rect(mon), mon->workspace.show_bar);
@@ -1530,8 +1775,9 @@ bool purp_wm_adopt_client_size(purp_wm_t *wm, size_t idx) {
     if (idx >= wm->window_count) return false;
     purp_window_t *win = wm->windows[idx];
     purp_size_t client;
-    if (!win->size_from_client || !(win->is_floating || win->is_scratchpad) || win->is_fullscreen ||
-        win->monitor < 0 || (size_t)win->monitor >= wm->monitor_count || !purp_window_client_geometry_size(win, &client)) return false;
+    if (!win->size_from_client || !(win->is_floating || win->is_scratchpad) ||
+        win->is_fullscreen || win->is_maximized || win->monitor < 0 ||
+        (size_t)win->monitor >= wm->monitor_count || !purp_window_client_geometry_size(win, &client)) return false;
     const purp_monitor_t *mon = &wm->monitors[win->monitor];
     int32_t top = mon->workspace.show_bar ? PURP_BAR_HEIGHT : 0;
     purp_size_t frame = { client.w + 2 * PURP_BORDER_WIDTH, client.h + 2 * PURP_BORDER_WIDTH };
@@ -1544,6 +1790,9 @@ bool purp_wm_adopt_client_size(purp_wm_t *wm, size_t idx) {
     win->client_sized_once = true;
     if (clamped.w != frame.w || clamped.h != frame.h) win->size_from_client = false;
     win->float_geo = purp_rect_make(loc.x, loc.y, clamped.w, clamped.h);
+    purp_window_t *parent = first && win->parent_id ? purp_wm_window_by_id(wm, win->parent_id) : NULL;
+    if (parent && purp_wm_is_window_visible(wm, parent) && parent->monitor == win->monitor)
+        win->float_geo = center_over_parent(wm, parent, win->float_geo);
     win->geo = win->float_geo;
     purp_wm_relayout(wm);
     return true;
@@ -1564,7 +1813,34 @@ void purp_wm_set_window_fullscreen(purp_wm_t *wm, size_t idx, bool fullscreen, i
     if (monitor >= 0 && (size_t)monitor < wm->monitor_count && wm->monitors[monitor].enabled &&
         wm->windows[idx]->monitor != monitor)
         purp_wm_send_window_to_monitor(wm, idx, (size_t)monitor, wm->focused_idx >= 0 && idx == (size_t)wm->focused_idx);
-    wm->windows[idx]->is_fullscreen = fullscreen;
+    purp_window_t *win = wm->windows[idx];
+    set_window_states(wm, win, fullscreen, win->is_maximized);
+    if (fullscreen && purp_wm_is_window_visible(wm, win)) {
+        for (size_t i = 0; i < wm->window_count; ++i) {
+            purp_window_t *other = wm->windows[i];
+            if (other != win && other->monitor == win->monitor && other->is_fullscreen &&
+                purp_wm_is_window_visible(wm, other))
+                set_window_states(wm, other, false, other->is_maximized);
+        }
+        wm->focused_idx = (int)idx;
+        wm->focused_monitor = win->monitor;
+    }
+    purp_wm_relayout(wm);
+}
+void purp_wm_set_window_maximized(purp_wm_t *wm, size_t idx, bool maximized) {
+    if (idx >= wm->window_count) return;
+    purp_window_t *win = wm->windows[idx];
+    set_window_states(wm, win, maximized ? false : win->is_fullscreen, maximized);
+    if (maximized && purp_wm_is_window_visible(wm, win)) {
+        for (size_t i = 0; i < wm->window_count; ++i) {
+            purp_window_t *other = wm->windows[i];
+            if (other != win && other->monitor == win->monitor && purp_wm_is_window_visible(wm, other) &&
+                (other->is_fullscreen || other->is_maximized))
+                set_window_states(wm, other, false, false);
+        }
+        wm->focused_idx = (int)idx;
+        wm->focused_monitor = win->monitor;
+    }
     purp_wm_relayout(wm);
 }
 void purp_wm_toggle_opacity_focused(purp_wm_t *wm) {

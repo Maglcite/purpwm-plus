@@ -1297,9 +1297,9 @@ void purp_server_shutdown_session(purp_server_t *server) {
 
 /* ---- session services ----------------------------------------------------------------------- */
 
-void purp_server_spawn_terminal(purp_server_t *server) {
-    purp_server_spawn_configured(server, PURP_ENV_TERMINAL, NULL,
-                                 PURP_COMMANDS(PURP_TERMINAL_COMMANDS), "terminal");
+bool purp_server_spawn_terminal(purp_server_t *server) {
+    return purp_server_spawn_configured(server, PURP_ENV_TERMINAL, NULL,
+                                        PURP_COMMANDS(PURP_TERMINAL_COMMANDS), "terminal");
 }
 
 void purp_server_spawn_spotlight_daemon(purp_server_t *server) {
@@ -1625,6 +1625,7 @@ void purp_server_lock_session(purp_server_t *server) {
     server->swallowed_button_count = 0;
     server->swallowed_touch_count = 0;
     server->touch_grab_slot = -1;
+    server->hovered_window_id = 0;
 
     /* Nothing may keep routing input behind the lock. */
     for (size_t i = 0; i < PURP_MAX_TOUCH_POINTS; ++i)
