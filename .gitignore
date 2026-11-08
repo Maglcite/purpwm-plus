@@ -1,0 +1,17 @@
+# Build output (binaries, objects, generated protocol code, embedded font)
+/build/
+
+# Stray compiler / tooling artifacts
+*.o
+*.d
+*.a
+*.so
+*.tmp
+compile_commands.json
+.cache/
+.clangd
+vgcore.*
+core
+core.*
+perf.data*
+__pycache__/

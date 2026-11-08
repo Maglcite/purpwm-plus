@@ -1,0 +1,192 @@
+#!/bin/sh
+set -e
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The installer replaces this marker with the selected configuration path.
+# INSTALLER_SESSION_CONFIG
+PURPWM_SESSION_CONFIG=${PURPWM_SESSION_CONFIG:-"$SCRIPT_DIR/../share/purpwm+/session.conf"}
+if [ -r "$PURPWM_SESSION_CONFIG" ]; then
+    . "$PURPWM_SESSION_CONFIG"
+fi
+USER_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/purpwm+/session.conf"
+if [ "$USER_CONFIG" != "$PURPWM_SESSION_CONFIG" ] && [ -r "$USER_CONFIG" ]; then
+    . "$USER_CONFIG"
+fi
+# Fall back to a purpwm v1 configuration for upgraded installs.
+LEGACY_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/purpwm/session.conf"
+if [ -r "$LEGACY_CONFIG" ]; then
+    . "$LEGACY_CONFIG"
+fi
+
+# Put installed helpers first, even when using a custom executable directory.
+export PATH="$SCRIPT_DIR:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:$PATH"
+if [ -z "$PURPWM_BIN" ]; then
+    if [ -x "$SCRIPT_DIR/purpwm+" ] && [ ! -d "$SCRIPT_DIR/purpwm+" ]; then
+        PURPWM_BIN="$SCRIPT_DIR/purpwm+"
+    elif [ -x "$SCRIPT_DIR/../build/purpwm+" ]; then
+        PURPWM_BIN="$SCRIPT_DIR/../build/purpwm+"
+    elif [ -x "$SCRIPT_DIR/../purpwm+" ]; then
+        PURPWM_BIN="$SCRIPT_DIR/../purpwm+"
+    else
+        PURPWM_BIN=$(command -v purpwm+ || true)
+    fi
+fi
+if [ ! -x "$PURPWM_BIN" ]; then
+    echo 'purpwm+ executable not found. Run ./install.sh, or set PURPWM_BIN to a release binary.' >&2
+    exit 1
+fi
+
+AUTOSTART=${PURPWM_AUTOSTART:-1}
+for arg in "$@"; do
+    if [ "$arg" = "--no-autostart" ]; then
+        AUTOSTART=0
+    fi
+done
+if [ "$AUTOSTART" = 0 ]; then
+    set -- --no-autostart "$@"
+fi
+
+# Ensure XDG_RUNTIME_DIR and systemd user D-Bus session bus are set properly
+UID_NUM="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID_NUM}"
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+
+# Export standard Wayland desktop session environment. The portal backend
+# selection and portals.conf UseIn match on "purpwm" for compatibility.
+export PURPWM_CURRENT_DESKTOP=purpwm
+export XDG_CURRENT_DESKTOP=purpwm
+export XDG_SESSION_DESKTOP=purpwm
+export XDG_SESSION_TYPE=wayland
+export QT_QPA_PLATFORM="wayland;xcb"
+export GDK_BACKEND="wayland,x11"
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=auto
+export _JAVA_AWT_WM_NONREPARENTING=1
+# WGPU_BACKEND=gl avoids Vulkan WSI stalls (VK_ERROR_SURFACE_LOST_KHR after a ~500ms
+# timeout) under nested / gamescope sessions whose compositor path lacks linux-dmabuf.
+export WGPU_BACKEND=gl
+
+# Initialize the daemon started by login PAM; --start alone does not unlock it.
+if [ "$AUTOSTART" != 0 ] && command -v gnome-keyring-daemon >/dev/null 2>&1; then
+    eval "$(gnome-keyring-daemon --start --components=pkcs11,secrets || true)"
+    export GNOME_KEYRING_CONTROL
+fi
+# SSH moved out of gnome-keyring into gcr; keep any existing agent.
+if [ "$AUTOSTART" != 0 ] && [ -z "$SSH_AUTH_SOCK" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user start gcr-ssh-agent.socket 2>/dev/null || true
+fi
+if [ -n "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    :
+elif [ -S "$XDG_RUNTIME_DIR/gcr/ssh" ]; then
+    export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/gcr/ssh"
+elif [ -S "$XDG_RUNTIME_DIR/keyring/ssh" ]; then
+    export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyring/ssh"
+fi
+
+# Import environment into systemd user session
+if [ "$AUTOSTART" != 0 ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS GNOME_KEYRING_CONTROL SSH_AUTH_SOCK PATH WGPU_BACKEND PURPWM_CURRENT_DESKTOP 2>/dev/null || true
+fi
+if [ "$AUTOSTART" != 0 ] && command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --systemd XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS QT_QPA_PLATFORM GDK_BACKEND MOZ_ENABLE_WAYLAND ELECTRON_OZONE_PLATFORM_HINT _JAVA_AWT_WM_NONREPARENTING WGPU_BACKEND GNOME_KEYRING_CONTROL SSH_AUTH_SOCK PATH PURPWM_CURRENT_DESKTOP 2>/dev/null || true
+fi
+
+# Ensure Wi-Fi and Bluetooth are active on session login.
+if [ "$AUTOSTART" != 0 ]; then (
+    nmcli networking on >/dev/null 2>&1 || true
+    nmcli radio wifi on >/dev/null 2>&1 || true
+    rfkill unblock bluetooth >/dev/null 2>&1 || true
+    bluetoothctl power on >/dev/null 2>&1 || true
+) &
+fi
+
+# Detect native DRM panel resolution. An internal panel (eDP/LVDS/DSI) wins
+# over whichever connected connector happens to sort first.
+NATIVE_W=1920
+NATIVE_H=1080
+INTERNAL_W=""
+INTERNAL_H=""
+EXTERNAL_W=""
+EXTERNAL_H=""
+for d in /sys/class/drm/card*-*; do
+    if [ -f "$d/status" ] && [ "$(cat "$d/status" 2>/dev/null)" = "connected" ] && [ -f "$d/modes" ]; then
+        MODE="$(head -n 1 "$d/modes" 2>/dev/null)"
+        if [ -n "$MODE" ]; then
+            W="${MODE%x*}"
+            H="${MODE#*x}"
+            if [ "$W" -ge 640 ] 2>/dev/null && [ "$H" -ge 480 ] 2>/dev/null; then
+                NAME="$(basename "$d")"
+                case "$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')" in
+                    *edp*|*lvds*|*dsi*)
+                        if [ -z "$INTERNAL_W" ]; then
+                            INTERNAL_W="$W"
+                            INTERNAL_H="$H"
+                        fi
+                        ;;
+                    *)
+                        if [ -z "$EXTERNAL_W" ]; then
+                            EXTERNAL_W="$W"
+                            EXTERNAL_H="$H"
+                        fi
+                        ;;
+                esac
+            fi
+        fi
+    fi
+done
+if [ -n "$INTERNAL_W" ]; then
+    NATIVE_W="$INTERNAL_W"
+    NATIVE_H="$INTERNAL_H"
+elif [ -n "$EXTERNAL_W" ]; then
+    NATIVE_W="$EXTERNAL_W"
+    NATIVE_H="$EXTERNAL_H"
+fi
+
+if [ "${PURPWM_RESOLUTION:-auto}" != auto ]; then
+    W=${PURPWM_RESOLUTION%x*}
+    H=${PURPWM_RESOLUTION#*x}
+    case "$W:$H" in
+        *[!0-9:]*|:*|*:) echo 'PURPWM_RESOLUTION must be WIDTHxHEIGHT or auto.' >&2; exit 1 ;;
+    esac
+    if [ "$PURPWM_RESOLUTION" != "${W}x${H}" ] || [ "$W" -lt 100 ] || [ "$H" -lt 100 ]; then
+        echo 'PURPWM_RESOLUTION must be WIDTHxHEIGHT (at least 100x100) or auto.' >&2
+        exit 1
+    fi
+    NATIVE_W=$W
+    NATIVE_H=$H
+fi
+REFRESH_RATE=${PURPWM_REFRESH_RATE:-120}
+case "$REFRESH_RATE" in
+    *[!0-9]*|'') echo 'PURPWM_REFRESH_RATE must be an integer between 1 and 1000.' >&2; exit 1 ;;
+esac
+if [ "$REFRESH_RATE" -lt 1 ] || [ "$REFRESH_RATE" -gt 1000 ]; then
+    echo 'PURPWM_REFRESH_RATE must be an integer between 1 and 1000.' >&2
+    exit 1
+fi
+
+# Check if running nested (inside an existing Wayland or X11 compositor)
+# or standalone (launched from COSMIC greeter / greetd on VT)
+if [ -n "$WAYLAND_DISPLAY" ] || [ -n "$DISPLAY" ]; then
+    exec "$PURPWM_BIN" "$@"
+else
+    export PURPWM_STANDALONE=1
+    case "${PURPWM_BACKEND:-drm}" in
+        drm)
+            exec "$PURPWM_BIN" --drm "$@"
+            ;;
+        gamescope)
+            if command -v gamescope >/dev/null 2>&1; then
+                exec gamescope -W "$NATIVE_W" -H "$NATIVE_H" -w "$NATIVE_W" -h "$NATIVE_H" -r "$REFRESH_RATE" -f --expose-wayland -- "$PURPWM_BIN" --standalone "$@"
+            else
+                echo 'PURPWM_BACKEND=gamescope requires gamescope. Install gamescope or use PURPWM_BACKEND=drm.' >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "PURPWM_BACKEND must be drm or gamescope (got '${PURPWM_BACKEND}')." >&2
+            exit 1
+            ;;
+    esac
+fi
